@@ -1,0 +1,1457 @@
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { audioAttribution, audioTracks } from "./audioManifest.js";
+
+const ROWS = 10;
+const COLS = 6;
+
+const TILE_TYPES = ["blank", "terminal", "straight", "curveLeft", "curveRight", "tJunction"];
+
+function hashStringToInt(str) {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i += 1) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+function mulberry32(seed) {
+  let t = seed >>> 0;
+  return function random() {
+    t += 0x6D2B79F5;
+    let x = t;
+    x = Math.imul(x ^ (x >>> 15), x | 1);
+    x ^= x + Math.imul(x ^ (x >>> 7), x | 61);
+    return ((x ^ (x >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+const BASE_EDGES = {
+  blank: [false, false, false, false],
+  terminal: [false, false, true, false],
+  straight: [true, false, true, false],
+  curveLeft: [true, false, false, true],
+  curveRight: [true, true, false, false],
+  tJunction: [true, true, false, true],
+  crossCurve: [true, true, true, true]
+};
+
+function getSymmetricCells(r, c, rows, cols) {
+  const set = new Set();
+  const pairs = [
+    [r, c],
+    [rows - 1 - r, c],
+    [r, cols - 1 - c],
+    [rows - 1 - r, cols - 1 - c]
+  ];
+  pairs.forEach(([rr, cc]) => set.add(`${rr}-${cc}`));
+  return Array.from(set);
+}
+
+function applySymmetricBlanks(edgesByCell, rows, cols, rand, percent) {
+  const target = Math.max(1, Math.round(rows * cols * percent));
+  const groups = [];
+  for (let r = 0; r < Math.ceil(rows / 2); r += 1) {
+    for (let c = 0; c < Math.ceil(cols / 2); c += 1) {
+      groups.push(getSymmetricCells(r, c, rows, cols));
+    }
+  }
+  for (let i = 0; i < groups.length; i += 1) {
+    const swapIndex = i + Math.floor(rand() * (groups.length - i));
+    [groups[i], groups[swapIndex]] = [groups[swapIndex], groups[i]];
+  }
+
+  const blanks = new Set();
+  for (const group of groups) {
+    if (blanks.size >= target) break;
+    group.forEach((key) => blanks.add(key));
+  }
+
+  blanks.forEach((key) => {
+    const [r, c] = key.split("-").map(Number);
+    const edges = edgesByCell.get(key) || [false, false, false, false];
+    const dirs = [0, 1, 2, 3];
+    dirs.forEach((dir) => {
+      if (!edges[dir]) return;
+      const nr = r + (dir === 2 ? 1 : dir === 0 ? -1 : 0);
+      const nc = c + (dir === 1 ? 1 : dir === 3 ? -1 : 0);
+      const neighborKey = `${nr}-${nc}`;
+      const neighborEdges = edgesByCell.get(neighborKey) || [false, false, false, false];
+      edges[dir] = false;
+      neighborEdges[oppositeDir(dir)] = false;
+      edgesByCell.set(key, edges);
+      edgesByCell.set(neighborKey, neighborEdges);
+    });
+    edgesByCell.set(key, [false, false, false, false]);
+  });
+}
+
+function makeBoard(seedText) {
+  const seed = hashStringToInt(seedText || "zen");
+  const rand = mulberry32(seed);
+  const edgesByCell = generateSolvedEdges(ROWS, COLS, rand);
+  applySymmetricBlanks(edgesByCell, ROWS, COLS, rand, 0.05);
+  const tiles = [];
+
+  for (let r = 0; r < ROWS; r += 1) {
+    for (let c = 0; c < COLS; c += 1) {
+      const edges = edgesByCell.get(`${r}-${c}`) || [false, false, false, false];
+      const { type, rotation } = pickTypeForEdges(edges);
+      tiles.push({
+        id: `${r}-${c}`,
+        r,
+        c,
+        type,
+        rotation: rotation,
+        rotationDegrees: rotation * 90,
+        targetRotation: rotation
+      });
+    }
+  }
+
+  const scrambleWithoutSolved = () => {
+    const next = tiles.map((tile) => {
+      const offset = Math.floor(rand() * 4);
+      const rotationScrambled = (tile.targetRotation + offset) % 4;
+      return {
+        ...tile,
+        rotation: rotationScrambled,
+        rotationDegrees: rotationScrambled * 90
+      };
+    });
+    const connections = computeConnections(next);
+    const completeDirs = computeCompleteDirs(next, connections);
+    const hasSolved = next.some((tile) => {
+      const dirs = completeDirs.get(tile.id) || [false, false, false, false];
+      return dirs.some(Boolean);
+    });
+    return { next, hasSolved };
+  };
+
+  let attempt = 0;
+  let result = scrambleWithoutSolved();
+  while (result.hasSolved && attempt < 20) {
+    attempt += 1;
+    result = scrambleWithoutSolved();
+  }
+
+  return result.next;
+}
+
+function rotateEdges(edges, rotation) {
+  let [n, e, s, w] = edges;
+  for (let i = 0; i < rotation; i += 1) {
+    [n, e, s, w] = [w, n, e, s];
+  }
+  return [n, e, s, w];
+}
+
+function getEdges(tile) {
+  const base = BASE_EDGES[tile.type];
+  if (!base) return [false, false, false, false];
+  if (tile.type === "crossCurve") return [true, true, true, true];
+  return rotateEdges(base, tile.rotation);
+}
+
+function edgesEqual(a, b) {
+  return a[0] === b[0] && a[1] === b[1] && a[2] === b[2] && a[3] === b[3];
+}
+
+function pickTypeForEdges(edges) {
+  const degree = edges.filter(Boolean).length;
+  let candidates = [];
+  if (degree === 0) candidates = ["blank"];
+  if (degree === 1) candidates = ["terminal"];
+  if (degree === 2) {
+    const isStraight = (edges[0] && edges[2]) || (edges[1] && edges[3]);
+    candidates = isStraight ? ["straight"] : ["curveLeft", "curveRight"];
+  }
+  if (degree === 3) candidates = ["tJunction"];
+  if (degree === 4) candidates = ["crossCurve"];
+
+  for (const type of candidates) {
+    const base = BASE_EDGES[type];
+    for (let rotation = 0; rotation < 4; rotation += 1) {
+      const rotated = type === "crossCurve" ? base : rotateEdges(base, rotation);
+      if (edgesEqual(rotated, edges)) {
+        return { type, rotation };
+      }
+    }
+  }
+  return { type: "blank", rotation: 0 };
+}
+
+function isBoundaryCell(r, c, rows, cols) {
+  return r === 0 || c === 0 || r === rows - 1 || c === cols - 1;
+}
+
+function mirrorCoord(r, c, rows, cols, mode) {
+  if (mode === "v") return [r, cols - 1 - c];
+  if (mode === "h") return [rows - 1 - r, c];
+  if (mode === "vh") return [rows - 1 - r, cols - 1 - c];
+  return [r, c];
+}
+
+function mirrorDir(dir, mode) {
+  let d = dir;
+  if (mode.includes("v")) {
+    if (d === 1) d = 3;
+    else if (d === 3) d = 1;
+  }
+  if (mode.includes("h")) {
+    if (d === 0) d = 2;
+    else if (d === 2) d = 0;
+  }
+  return d;
+}
+
+function canAddEdge(edgesByCell, r1, c1, r2, c2, dir, maxDegree) {
+  const edgesA = edgesByCell.get(`${r1}-${c1}`) || [false, false, false, false];
+  const edgesB = edgesByCell.get(`${r2}-${c2}`) || [false, false, false, false];
+  if (edgesA[dir]) return false;
+  const degreeA = edgesA.filter(Boolean).length;
+  const degreeB = edgesB.filter(Boolean).length;
+  if (degreeA + 1 > maxDegree || degreeB + 1 > maxDegree) return false;
+  return true;
+}
+
+function addEdge(edgesByCell, r1, c1, r2, c2, dir) {
+  const keyA = `${r1}-${c1}`;
+  const keyB = `${r2}-${c2}`;
+  const edgesA = edgesByCell.get(keyA) || [false, false, false, false];
+  const edgesB = edgesByCell.get(keyB) || [false, false, false, false];
+  edgesA[dir] = true;
+  edgesB[oppositeDir(dir)] = true;
+  edgesByCell.set(keyA, edgesA);
+  edgesByCell.set(keyB, edgesB);
+}
+
+function generateSolvedEdges(rows, cols, rand) {
+  const edgesByCell = new Map();
+  const visited = new Set();
+  const stack = [];
+
+  const start = [0, 0];
+  stack.push(start);
+  visited.add(start.join("-"));
+  edgesByCell.set(start.join("-"), [false, false, false, false]);
+
+  while (stack.length) {
+    const [r, c] = stack[stack.length - 1];
+    const neighbors = [];
+    if (r > 0 && !visited.has(`${r - 1}-${c}`)) neighbors.push([r - 1, c, 0]);
+    if (c < cols - 1 && !visited.has(`${r}-${c + 1}`)) neighbors.push([r, c + 1, 1]);
+    if (r < rows - 1 && !visited.has(`${r + 1}-${c}`)) neighbors.push([r + 1, c, 2]);
+    if (c > 0 && !visited.has(`${r}-${c - 1}`)) neighbors.push([r, c - 1, 3]);
+
+    if (neighbors.length === 0) {
+      stack.pop();
+      continue;
+    }
+
+    const nextIndex = Math.floor(rand() * neighbors.length);
+    const [nr, nc, dir] = neighbors[nextIndex];
+    const currentKey = `${r}-${c}`;
+    const nextKey = `${nr}-${nc}`;
+
+    const currentEdges = edgesByCell.get(currentKey) || [false, false, false, false];
+    const nextEdges = edgesByCell.get(nextKey) || [false, false, false, false];
+    currentEdges[dir] = true;
+    nextEdges[oppositeDir(dir)] = true;
+    edgesByCell.set(currentKey, currentEdges);
+    edgesByCell.set(nextKey, nextEdges);
+
+    visited.add(nextKey);
+    stack.push([nr, nc]);
+  }
+
+  // Add extra edges to create cycles / higher-degree nodes (crosses).
+  const candidates = [];
+  for (let r = 0; r < rows; r += 1) {
+    for (let c = 0; c < cols; c += 1) {
+      if (r < rows - 1) candidates.push([r, c, r + 1, c]);
+      if (c < cols - 1) candidates.push([r, c, r, c + 1]);
+    }
+  }
+
+  const maxCrosses = 0;
+  const maxTJunctions = Math.max(2, Math.floor((rows * cols) / 6));
+  const extraEdgesTarget = Math.max(1, Math.floor((rows * cols) / 7));
+  let added = 0;
+  const countCrosses = () => {
+    let count = 0;
+    for (let r = 0; r < rows; r += 1) {
+      for (let c = 0; c < cols; c += 1) {
+        const edges = edgesByCell.get(`${r}-${c}`) || [false, false, false, false];
+        if (edges.filter(Boolean).length === 4) count += 1;
+      }
+    }
+    return count;
+  };
+
+  const countTJunctions = () => {
+    let count = 0;
+    for (let r = 0; r < rows; r += 1) {
+      for (let c = 0; c < cols; c += 1) {
+        const edges = edgesByCell.get(`${r}-${c}`) || [false, false, false, false];
+        if (edges.filter(Boolean).length === 3) count += 1;
+      }
+    }
+    return count;
+  };
+
+  for (let i = 0; i < candidates.length && added < extraEdgesTarget; i += 1) {
+    const swapIndex = i + Math.floor(rand() * (candidates.length - i));
+    [candidates[i], candidates[swapIndex]] = [candidates[swapIndex], candidates[i]];
+
+    const [r1, c1, r2, c2] = candidates[i];
+    const keyA = `${r1}-${c1}`;
+    const keyB = `${r2}-${c2}`;
+    const dir = r2 > r1 ? 2 : r2 < r1 ? 0 : c2 > c1 ? 1 : 3;
+    const edgesA = edgesByCell.get(keyA) || [false, false, false, false];
+    const edgesB = edgesByCell.get(keyB) || [false, false, false, false];
+
+    if (edgesA[dir]) continue;
+
+    const degreeA = edgesA.filter(Boolean).length;
+    const degreeB = edgesB.filter(Boolean).length;
+    if (degreeA >= 4 || degreeB >= 4) continue;
+
+    // Avoid creating a 4-way cross on boundary cells.
+    const nextDegreeA = degreeA + 1;
+    const nextDegreeB = degreeB + 1;
+    if (nextDegreeA === 4 && isBoundaryCell(r1, c1, rows, cols)) continue;
+    if (nextDegreeB === 4 && isBoundaryCell(r2, c2, rows, cols)) continue;
+
+    edgesA[dir] = true;
+    edgesB[oppositeDir(dir)] = true;
+    edgesByCell.set(keyA, edgesA);
+    edgesByCell.set(keyB, edgesB);
+    if (countCrosses() <= maxCrosses) {
+      added += 1;
+    } else {
+      edgesA[dir] = false;
+      edgesB[oppositeDir(dir)] = false;
+      edgesByCell.set(keyA, edgesA);
+      edgesByCell.set(keyB, edgesB);
+    }
+  }
+
+  // Promote interior degree-3 nodes to degree-4 when possible (to create crosses).
+  const promotionTargets = [];
+  for (let r = 1; r < rows - 1; r += 1) {
+    for (let c = 1; c < cols - 1; c += 1) {
+      const key = `${r}-${c}`;
+      const edges = edgesByCell.get(key) || [false, false, false, false];
+      const degree = edges.filter(Boolean).length;
+      if (degree === 3) promotionTargets.push([r, c]);
+    }
+  }
+
+  for (let i = 0; i < promotionTargets.length; i += 1) {
+    const swapIndex = i + Math.floor(rand() * (promotionTargets.length - i));
+    [promotionTargets[i], promotionTargets[swapIndex]] = [
+      promotionTargets[swapIndex],
+      promotionTargets[i]
+    ];
+  }
+
+  for (const [r, c] of promotionTargets) {
+    if (countCrosses() >= maxCrosses) break;
+    const key = `${r}-${c}`;
+    const edges = edgesByCell.get(key) || [false, false, false, false];
+    const missingDirs = [0, 1, 2, 3].filter((dir) => !edges[dir]);
+    for (const dir of missingDirs) {
+      const nr = r + (dir === 2 ? 1 : dir === 0 ? -1 : 0);
+      const nc = c + (dir === 1 ? 1 : dir === 3 ? -1 : 0);
+      const neighborKey = `${nr}-${nc}`;
+      const neighborEdges = edgesByCell.get(neighborKey) || [false, false, false, false];
+      const neighborDegree = neighborEdges.filter(Boolean).length;
+      if (neighborDegree >= 4) continue;
+      if (neighborDegree === 3 && isBoundaryCell(nr, nc, rows, cols)) continue;
+      edges[dir] = true;
+      neighborEdges[oppositeDir(dir)] = true;
+      edgesByCell.set(key, edges);
+      edgesByCell.set(neighborKey, neighborEdges);
+      if (countCrosses() > maxCrosses) {
+        edges[dir] = false;
+        neighborEdges[oppositeDir(dir)] = false;
+        edgesByCell.set(key, edges);
+        edgesByCell.set(neighborKey, neighborEdges);
+      } else {
+        break;
+      }
+    }
+  }
+
+  // Apply soft 4-way symmetry to edges (mirror with small omissions).
+  const softness = 0.18;
+  const keys = Array.from(edgesByCell.keys());
+  keys.forEach((key) => {
+    const [r, c] = key.split("-").map(Number);
+    const edges = edgesByCell.get(key) || [false, false, false, false];
+    edges.forEach((hasEdge, dir) => {
+      if (!hasEdge) return;
+      const [vr, vc] = mirrorCoord(r, c, rows, cols, "v");
+      const [hr, hc] = mirrorCoord(r, c, rows, cols, "h");
+      const [vrh, vch] = mirrorCoord(r, c, rows, cols, "vh");
+      const dirV = mirrorDir(dir, "v");
+      const dirH = mirrorDir(dir, "h");
+      const dirVH = mirrorDir(dir, "vh");
+
+      const mirrorPairs = [
+        [vr, vc, dirV],
+        [hr, hc, dirH],
+        [vrh, vch, dirVH]
+      ];
+
+      mirrorPairs.forEach(([mr, mc, mdir]) => {
+        if (rand() < softness) return;
+        const nr = mr + (mdir === 2 ? 1 : mdir === 0 ? -1 : 0);
+        const nc = mc + (mdir === 1 ? 1 : mdir === 3 ? -1 : 0);
+        if (nr < 0 || nc < 0 || nr >= rows || nc >= cols) return;
+        if (canAddEdge(edgesByCell, mr, mc, nr, nc, mdir, 3)) {
+          addEdge(edgesByCell, mr, mc, nr, nc, mdir);
+        }
+      });
+    });
+  });
+
+  // Defensive pass: if a boundary cell ended up with degree 4, drop one edge.
+  for (let r = 0; r < rows; r += 1) {
+    for (let c = 0; c < cols; c += 1) {
+      if (!isBoundaryCell(r, c, rows, cols)) continue;
+      const key = `${r}-${c}`;
+      const edges = edgesByCell.get(key) || [false, false, false, false];
+      const degree = edges.filter(Boolean).length;
+      if (degree !== 4) continue;
+      const dirs = [0, 1, 2, 3].filter((d) => edges[d]);
+      const dropDir = dirs[Math.floor(rand() * dirs.length)];
+      const nr = r + (dropDir === 2 ? 1 : dropDir === 0 ? -1 : 0);
+      const nc = c + (dropDir === 1 ? 1 : dropDir === 3 ? -1 : 0);
+      const neighborKey = `${nr}-${nc}`;
+      const neighborEdges = edgesByCell.get(neighborKey) || [false, false, false, false];
+      edges[dropDir] = false;
+      neighborEdges[oppositeDir(dropDir)] = false;
+      edgesByCell.set(key, edges);
+      edgesByCell.set(neighborKey, neighborEdges);
+    }
+  }
+
+  const isConnectedGraph = () => {
+    const start = "0-0";
+    const visitedNodes = new Set();
+    const stackNodes = [start];
+    while (stackNodes.length) {
+      const key = stackNodes.pop();
+      if (visitedNodes.has(key)) continue;
+      visitedNodes.add(key);
+      const [r, c] = key.split("-").map(Number);
+      const edges = edgesByCell.get(key) || [false, false, false, false];
+      const neighbors = [
+        [r - 1, c],
+        [r, c + 1],
+        [r + 1, c],
+        [r, c - 1]
+      ];
+      edges.forEach((hasEdge, dir) => {
+        if (!hasEdge) return;
+        const [nr, nc] = neighbors[dir];
+        if (nr < 0 || nc < 0 || nr >= rows || nc >= cols) return;
+        stackNodes.push(`${nr}-${nc}`);
+      });
+    }
+    return visitedNodes.size === rows * cols;
+  };
+
+  const canRemoveEdge = (r, c, dir) => {
+    const nr = r + (dir === 2 ? 1 : dir === 0 ? -1 : 0);
+    const nc = c + (dir === 1 ? 1 : dir === 3 ? -1 : 0);
+    if (nr < 0 || nc < 0 || nr >= rows || nc >= cols) return false;
+    const keyA = `${r}-${c}`;
+    const keyB = `${nr}-${nc}`;
+    const edgesA = edgesByCell.get(keyA) || [false, false, false, false];
+    const edgesB = edgesByCell.get(keyB) || [false, false, false, false];
+    if (!edgesA[dir]) return false;
+    edgesA[dir] = false;
+    edgesB[oppositeDir(dir)] = false;
+    edgesByCell.set(keyA, edgesA);
+    edgesByCell.set(keyB, edgesB);
+    const connected = isConnectedGraph();
+    if (!connected) {
+      edgesA[dir] = true;
+      edgesB[oppositeDir(dir)] = true;
+      edgesByCell.set(keyA, edgesA);
+      edgesByCell.set(keyB, edgesB);
+      return false;
+    }
+    return true;
+  };
+
+  // Enforce hard max cross count by removing non-bridge edges from degree-4 cells.
+  let crosses = countCrosses();
+  if (crosses > maxCrosses) {
+    const crossCells = [];
+    for (let r = 0; r < rows; r += 1) {
+      for (let c = 0; c < cols; c += 1) {
+        const edges = edgesByCell.get(`${r}-${c}`) || [false, false, false, false];
+        if (edges.filter(Boolean).length === 4) crossCells.push([r, c]);
+      }
+    }
+    for (let i = 0; i < crossCells.length && crosses > maxCrosses; i += 1) {
+      const swapIndex = i + Math.floor(rand() * (crossCells.length - i));
+      [crossCells[i], crossCells[swapIndex]] = [crossCells[swapIndex], crossCells[i]];
+      const [r, c] = crossCells[i];
+      const dirs = [0, 1, 2, 3];
+      for (let d = 0; d < dirs.length && crosses > maxCrosses; d += 1) {
+        const dir = dirs[d];
+        if (canRemoveEdge(r, c, dir)) {
+          crosses = countCrosses();
+          break;
+        }
+      }
+    }
+  }
+
+  // Reduce degree-3 nodes to balance tile types.
+  let tCount = countTJunctions();
+  if (tCount > maxTJunctions) {
+    const tCells = [];
+    for (let r = 0; r < rows; r += 1) {
+      for (let c = 0; c < cols; c += 1) {
+        const edges = edgesByCell.get(`${r}-${c}`) || [false, false, false, false];
+        if (edges.filter(Boolean).length === 3) tCells.push([r, c]);
+      }
+    }
+    for (let i = 0; i < tCells.length && tCount > maxTJunctions; i += 1) {
+      const swapIndex = i + Math.floor(rand() * (tCells.length - i));
+      [tCells[i], tCells[swapIndex]] = [tCells[swapIndex], tCells[i]];
+      const [r, c] = tCells[i];
+      const edges = edgesByCell.get(`${r}-${c}`) || [false, false, false, false];
+      const dirs = [0, 1, 2, 3].filter((dir) => edges[dir]);
+      for (let d = 0; d < dirs.length && tCount > maxTJunctions; d += 1) {
+        if (canRemoveEdge(r, c, dirs[d])) {
+          tCount = countTJunctions();
+          break;
+        }
+      }
+    }
+  }
+
+  return edgesByCell;
+}
+
+function oppositeDir(dir) {
+  return (dir + 2) % 4;
+}
+
+function connectionBitmask(connections) {
+  return (
+    (connections[0] ? 1 : 0) |
+    (connections[1] ? 2 : 0) |
+    (connections[2] ? 4 : 0) |
+    (connections[3] ? 8 : 0)
+  );
+}
+
+function computeConnections(tiles) {
+  const byId = new Map();
+  const byPos = new Map();
+  tiles.forEach((tile) => {
+    byId.set(tile.id, tile);
+    byPos.set(`${tile.r}-${tile.c}`, tile);
+  });
+
+  const connections = new Map();
+
+  tiles.forEach((tile) => {
+    const edges = getEdges(tile);
+    const connected = [false, false, false, false];
+    const neighbors = [
+      byPos.get(`${tile.r - 1}-${tile.c}`),
+      byPos.get(`${tile.r}-${tile.c + 1}`),
+      byPos.get(`${tile.r + 1}-${tile.c}`),
+      byPos.get(`${tile.r}-${tile.c - 1}`)
+    ];
+
+    edges.forEach((hasEdge, dir) => {
+      if (!hasEdge) return;
+      const neighbor = neighbors[dir];
+      if (!neighbor) return;
+      const neighborEdges = getEdges(neighbor);
+      if (neighborEdges[oppositeDir(dir)]) {
+        connected[dir] = true;
+      }
+    });
+
+    connections.set(tile.id, connected);
+  });
+
+  return connections;
+}
+
+function getInternalPortPairs(tile, edges) {
+  if (tile.type === "crossCurve") {
+    return [
+      [0, 2],
+      [1, 3]
+    ];
+  }
+  const dirs = [];
+  edges.forEach((on, dir) => {
+    if (on) dirs.push(dir);
+  });
+  if (dirs.length === 2) return [[dirs[0], dirs[1]]];
+  if (dirs.length === 3) {
+    return [
+      [dirs[0], dirs[1]],
+      [dirs[1], dirs[2]],
+      [dirs[0], dirs[2]]
+    ];
+  }
+  return [];
+}
+
+function computeCompleteDirs(tiles, connections) {
+  const byId = new Map();
+  const byPos = new Map();
+  tiles.forEach((tile) => {
+    byId.set(tile.id, tile);
+    byPos.set(`${tile.r}-${tile.c}`, tile);
+  });
+
+  const portAdj = new Map();
+  const danglingPorts = new Set();
+  const allPorts = [];
+
+  tiles.forEach((tile) => {
+    const edges = getEdges(tile);
+    const connected = connections.get(tile.id) || [false, false, false, false];
+    const keyBase = tile.id;
+
+    edges.forEach((hasEdge, dir) => {
+      if (!hasEdge) return;
+      const port = `${keyBase}:${dir}`;
+      allPorts.push(port);
+      if (!portAdj.has(port)) portAdj.set(port, new Set());
+      if (!connected[dir]) danglingPorts.add(port);
+    });
+
+    const internalPairs = getInternalPortPairs(tile, edges);
+    internalPairs.forEach(([a, b]) => {
+      const portA = `${keyBase}:${a}`;
+      const portB = `${keyBase}:${b}`;
+      if (portAdj.has(portA) && portAdj.has(portB)) {
+        portAdj.get(portA).add(portB);
+        portAdj.get(portB).add(portA);
+      }
+    });
+  });
+
+  tiles.forEach((tile) => {
+    const connected = connections.get(tile.id) || [false, false, false, false];
+    const neighbors = [
+      byPos.get(`${tile.r - 1}-${tile.c}`),
+      byPos.get(`${tile.r}-${tile.c + 1}`),
+      byPos.get(`${tile.r + 1}-${tile.c}`),
+      byPos.get(`${tile.r}-${tile.c - 1}`)
+    ];
+
+    connected.forEach((isConnected, dir) => {
+      if (!isConnected) return;
+      const neighbor = neighbors[dir];
+      if (!neighbor) return;
+      const portA = `${tile.id}:${dir}`;
+      const portB = `${neighbor.id}:${oppositeDir(dir)}`;
+      if (portAdj.has(portA) && portAdj.has(portB)) {
+        portAdj.get(portA).add(portB);
+        portAdj.get(portB).add(portA);
+      }
+    });
+  });
+
+  const visitedPorts = new Set();
+  const completePorts = new Set();
+
+  allPorts.forEach((port) => {
+    if (visitedPorts.has(port)) return;
+    const stack = [port];
+    const component = [];
+    let isClosed = true;
+
+    while (stack.length) {
+      const current = stack.pop();
+      if (!current || visitedPorts.has(current)) continue;
+      visitedPorts.add(current);
+      component.push(current);
+      if (danglingPorts.has(current)) isClosed = false;
+      const neighbors = portAdj.get(current) || [];
+      neighbors.forEach((next) => {
+        if (!visitedPorts.has(next)) stack.push(next);
+      });
+    }
+
+    if (isClosed) {
+      component.forEach((p) => completePorts.add(p));
+    }
+  });
+
+  const completeDirs = new Map();
+  tiles.forEach((tile) => {
+    const dirs = [false, false, false, false];
+    for (let dir = 0; dir < 4; dir += 1) {
+      if (completePorts.has(`${tile.id}:${dir}`)) dirs[dir] = true;
+    }
+    completeDirs.set(tile.id, dirs);
+  });
+
+  return completeDirs;
+}
+
+function Tile({ tile, onRotate }) {
+  const localCompleteDirs = rotateEdges(
+    tile.completeDirs || [false, false, false, false],
+    (4 - tile.rotation) % 4
+  );
+  const isTileComplete = localCompleteDirs.some(Boolean);
+  return (
+    <button
+      type="button"
+      className={`tile ${tile.type === "blank" ? "tile-blank" : ""} ${tile.connectionFlash ? "tile-flash" : ""} ${isTileComplete ? "tile-complete" : ""}`}
+      onClick={onRotate}
+      aria-label={`Tile ${tile.r + 1}, ${tile.c + 1}`}
+      disabled={tile.type === "blank"}
+    >
+      <div
+        className="tile-graphic"
+        style={{ transform: `rotate(${tile.rotationDegrees}deg)` }}
+      >
+        <TileSVG type={tile.type} completeDirs={localCompleteDirs} />
+      </div>
+    </button>
+  );
+}
+
+function TileSVG({ type, completeDirs }) {
+  const [n, e, s, w] = completeDirs || [false, false, false, false];
+  const isSegmentComplete = (dirs) => dirs.every((dir) => completeDirs?.[dir]);
+  return (
+    <svg viewBox="0 0 100 100" aria-hidden="true">
+      <g
+        className="tile-stroke"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="10"
+        strokeLinecap="round"
+      >
+        {type === "blank" && null}
+        {type === "terminal" && (
+          <>
+            <circle
+              cx="50"
+              cy="18"
+              r="10"
+              className={isSegmentComplete([2]) ? "tile-stroke-complete" : ""}
+            />
+            <line
+              x1="50"
+              y1="28"
+              x2="50"
+              y2="95"
+              className={isSegmentComplete([2]) ? "tile-stroke-complete" : ""}
+            />
+          </>
+        )}
+        {type === "straight" && (
+          <line
+            x1="50"
+            y1="5"
+            x2="50"
+            y2="95"
+            className={isSegmentComplete([0, 2]) ? "tile-stroke-complete" : ""}
+          />
+        )}
+        {type === "curveLeft" && (
+          <path
+            d="M 50 5 Q 50 50 5 50"
+            className={isSegmentComplete([0, 3]) ? "tile-stroke-complete" : ""}
+          />
+        )}
+        {type === "curveRight" && (
+          <path
+            d="M 50 5 Q 50 50 95 50"
+            className={isSegmentComplete([0, 1]) ? "tile-stroke-complete" : ""}
+          />
+        )}
+        {type === "tJunction" && (
+          <>
+            <line
+              x1="50"
+              y1="5"
+              x2="50"
+              y2="50"
+              className={isSegmentComplete([0]) ? "tile-stroke-complete" : ""}
+            />
+            <line
+              x1="5"
+              y1="50"
+              x2="95"
+              y2="50"
+              className={isSegmentComplete([1, 3]) ? "tile-stroke-complete" : ""}
+            />
+          </>
+        )}
+        {type === "crossCurve" && (
+          <>
+            <line
+              x1="50"
+              y1="5"
+              x2="50"
+              y2="95"
+              className={isSegmentComplete([0, 2]) ? "tile-stroke-complete" : ""}
+            />
+            <line
+              x1="5"
+              y1="50"
+              x2="95"
+              y2="50"
+              className={isSegmentComplete([1, 3]) ? "tile-stroke-complete" : ""}
+            />
+          </>
+        )}
+      </g>
+    </svg>
+  );
+}
+
+export default function App() {
+  const [seedText, setSeedText] = useState("zen-001");
+  const [tiles, setTiles] = useState(() => makeBoard("zen-001"));
+  const [connectionFlashIds, setConnectionFlashIds] = useState(new Set());
+  const [fxVolume, setFxVolume] = useState(1);
+  const [bgVolume, setBgVolume] = useState(0.3);
+  const [rotateSoundIndex, setRotateSoundIndex] = useState(4);
+  const [completeSoundIndex, setCompleteSoundIndex] = useState(2);
+  const [bgQueue, setBgQueue] = useState([]);
+  const [bgQueuePos, setBgQueuePos] = useState(0);
+  const [bgNowPlayingIndex, setBgNowPlayingIndex] = useState(0);
+  const [showAttribution, setShowAttribution] = useState(false);
+  const prevConnectionBitsRef = useRef(new Map());
+  const prevCompleteBitsRef = useRef(new Map());
+  const audioCtxRef = useRef(null);
+  const bgAudioRef = useRef(null);
+  const bgGainRef = useRef(null);
+  const bgSourceRef = useRef(null);
+  const hasInteractedRef = useRef(false);
+
+  const connections = useMemo(() => computeConnections(tiles), [tiles]);
+  const completeDirs = useMemo(() => computeCompleteDirs(tiles, connections), [tiles, connections]);
+
+  useEffect(() => {
+    const savedRotate = Number(localStorage.getItem("zen_rotate_sound"));
+    const savedComplete = Number(localStorage.getItem("zen_complete_sound"));
+    const savedBgVolume = Number(localStorage.getItem("zen_bg_volume"));
+    const savedFxVolume = Number(localStorage.getItem("zen_fx_volume"));
+    if (!Number.isNaN(savedRotate)) setRotateSoundIndex(savedRotate);
+    if (!Number.isNaN(savedComplete)) setCompleteSoundIndex(savedComplete);
+    if (!Number.isNaN(savedBgVolume)) setBgVolume(savedBgVolume);
+    if (!Number.isNaN(savedFxVolume)) setFxVolume(savedFxVolume);
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem("zen_rotate_sound", String(rotateSoundIndex));
+  }, [rotateSoundIndex]);
+
+  useEffect(() => {
+    localStorage.setItem("zen_complete_sound", String(completeSoundIndex));
+  }, [completeSoundIndex]);
+
+  useEffect(() => {
+    localStorage.setItem("zen_bg_volume", String(bgVolume));
+  }, [bgVolume]);
+
+  useEffect(() => {
+    localStorage.setItem("zen_fx_volume", String(fxVolume));
+  }, [fxVolume]);
+
+  useEffect(() => {
+    const indices = Array.from({ length: 10 }, (_, i) => i);
+    for (let i = indices.length - 1; i > 0; i -= 1) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [indices[i], indices[j]] = [indices[j], indices[i]];
+    }
+    setBgQueue(indices);
+    setBgQueuePos(0);
+    setBgNowPlayingIndex(indices[0]);
+  }, []);
+
+  useEffect(() => {
+    const nextFlash = new Set();
+    const nextBits = new Map();
+
+    tiles.forEach((tile) => {
+      const connected = connections.get(tile.id) || [false, false, false, false];
+      const bits = connectionBitmask(connected);
+      const prevBits = prevConnectionBitsRef.current.get(tile.id) || 0;
+      if ((bits & ~prevBits) !== 0) {
+        nextFlash.add(tile.id);
+      }
+      nextBits.set(tile.id, bits);
+    });
+
+    prevConnectionBitsRef.current = nextBits;
+    if (!hasInteractedRef.current) {
+      return undefined;
+    }
+    if (nextFlash.size > 0) {
+      setConnectionFlashIds(nextFlash);
+      const timeout = setTimeout(() => {
+        setConnectionFlashIds(new Set());
+      }, 900);
+      return () => clearTimeout(timeout);
+    }
+    return undefined;
+  }, [tiles, connections]);
+
+  useEffect(() => {
+    const nextBits = new Map();
+    let hasNewComplete = false;
+    tiles.forEach((tile) => {
+      const dirs = completeDirs.get(tile.id) || [false, false, false, false];
+      const bits = connectionBitmask(dirs);
+      const prevBits = prevCompleteBitsRef.current.get(tile.id) || 0;
+      if ((bits & ~prevBits) !== 0) {
+        hasNewComplete = true;
+      }
+      nextBits.set(tile.id, bits);
+    });
+    prevCompleteBitsRef.current = nextBits;
+    if (hasNewComplete) {
+      playSelectedComplete();
+    }
+  }, [tiles, completeDirs]);
+
+  function ensureAudioContext() {
+    if (!audioCtxRef.current) {
+      audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    if (audioCtxRef.current.state === "suspended") {
+      audioCtxRef.current.resume();
+    }
+    return audioCtxRef.current;
+  }
+
+  function ensureAudioReady() {
+    const ctx = ensureAudioContext();
+    if (bgVolume > 0) {
+      if (!bgAudioRef.current) {
+        startAmbient();
+      } else if (bgAudioRef.current.paused) {
+        bgAudioRef.current.play().catch(() => {});
+      }
+    }
+    return ctx;
+  }
+
+  function playScrape({ duration = 0.12, gain = 0.06 }) {
+    if (!soundOn) return;
+    const ctx = ensureAudioContext();
+    const buffer = ctx.createBuffer(1, ctx.sampleRate * duration, ctx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < data.length; i += 1) {
+      data[i] = (Math.random() * 2 - 1) * (1 - i / data.length);
+    }
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+
+    const filter = ctx.createBiquadFilter();
+    filter.type = "bandpass";
+    filter.frequency.value = 900;
+    filter.Q.value = 1.4;
+
+    const amp = ctx.createGain();
+    amp.gain.value = 0;
+    amp.gain.linearRampToValueAtTime(gain, ctx.currentTime + 0.01);
+    amp.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + duration);
+
+    source.connect(filter);
+    filter.connect(amp);
+    amp.connect(ctx.destination);
+    source.start();
+  }
+
+  function playCompleteSweep() {
+    if (!soundOn) return;
+    const ctx = ensureAudioContext();
+    const osc = ctx.createOscillator();
+    const osc2 = ctx.createOscillator();
+    const filter = ctx.createBiquadFilter();
+    const amp = ctx.createGain();
+    osc.type = "sine";
+    osc2.type = "sine";
+    osc.frequency.value = 196;
+    osc2.frequency.value = 247;
+    filter.type = "lowpass";
+    filter.frequency.value = 520;
+    amp.gain.value = 0;
+    amp.gain.linearRampToValueAtTime(0.03, ctx.currentTime + 0.06);
+    amp.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 1.6);
+    filter.frequency.exponentialRampToValueAtTime(300, ctx.currentTime + 1.4);
+    osc.connect(filter);
+    osc2.connect(filter);
+    filter.connect(amp);
+    amp.connect(ctx.destination);
+    osc.start();
+    osc2.start();
+    osc.stop(ctx.currentTime + 1.7);
+    osc2.stop(ctx.currentTime + 1.7);
+  }
+
+  const testSounds = [
+    { type: "sine", freq: 180, duration: 0.9, gain: 0.025 },
+    { type: "sine", freq: 220, duration: 0.7, gain: 0.03 },
+    { type: "triangle", freq: 196, duration: 0.8, gain: 0.022 },
+    { type: "triangle", freq: 247, duration: 0.75, gain: 0.02 },
+    { type: "sine", freq: 262, duration: 0.6, gain: 0.02 },
+    { type: "sine", freq: 294, duration: 0.55, gain: 0.018 },
+    { type: "sine", freq: 330, duration: 0.5, gain: 0.016 },
+    { type: "triangle", freq: 174, duration: 0.9, gain: 0.02 },
+    { type: "sine", freq: 196, duration: 1.1, gain: 0.02, sweepTo: 240 },
+    { type: "sine", freq: 220, duration: 1.1, gain: 0.02, sweepTo: 180 },
+    { type: "sine", freq: 246, duration: 1.2, gain: 0.018, sweepTo: 200 },
+    { type: "sine", freq: 180, duration: 0.6, gain: 0.02, lowpass: 500 },
+    { type: "sine", freq: 210, duration: 0.7, gain: 0.02, lowpass: 450 },
+    { type: "sine", freq: 240, duration: 0.8, gain: 0.02, lowpass: 380 },
+    { type: "noise", duration: 0.5, gain: 0.018, bandpass: 650 },
+    { type: "noise", duration: 0.7, gain: 0.02, bandpass: 520 },
+    { type: "noise", duration: 0.9, gain: 0.02, bandpass: 420 },
+    { type: "sine", freq: 196, duration: 1.4, gain: 0.018, sweepTo: 164, lowpass: 420 },
+    { type: "sine", freq: 233, duration: 1.3, gain: 0.017, sweepTo: 196, lowpass: 360 },
+    { type: "sine", freq: 262, duration: 1.2, gain: 0.016, sweepTo: 220, lowpass: 320 }
+  ];
+
+  const completeMelodies = [
+    [0, 2, 4],
+    [1, 3, 5],
+    [2, 4, 6],
+    [3, 5, 7],
+    [4, 6, 8],
+    [5, 7, 9],
+    [6, 8, 10],
+    [7, 9, 11],
+    [8, 10, 12],
+    [9, 11, 13],
+    [10, 12, 14],
+    [11, 13, 15],
+    [12, 14, 16],
+    [13, 15, 17],
+    [14, 16, 18],
+    [15, 17, 19],
+    [16, 18, 0],
+    [17, 19, 1],
+    [18, 0, 2],
+    [19, 1, 3]
+  ];
+
+  function playTestSound(index) {
+    if (fxVolume === 0) return;
+    const ctx = ensureAudioReady();
+    const preset = testSounds[index % testSounds.length];
+    if (preset.type === "noise") {
+      const buffer = ctx.createBuffer(1, ctx.sampleRate * preset.duration, ctx.sampleRate);
+      const data = buffer.getChannelData(0);
+      for (let i = 0; i < data.length; i += 1) {
+        data[i] = (Math.random() * 2 - 1) * (1 - i / data.length);
+      }
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      const filter = ctx.createBiquadFilter();
+      filter.type = "bandpass";
+      filter.frequency.value = preset.bandpass || 520;
+      filter.Q.value = 1.2;
+      const amp = ctx.createGain();
+      amp.gain.value = 0;
+      amp.gain.linearRampToValueAtTime(preset.gain * fxVolume, ctx.currentTime + 0.02);
+      amp.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + preset.duration);
+      source.connect(filter);
+      filter.connect(amp);
+      amp.connect(ctx.destination);
+      source.start();
+      return;
+    }
+
+    const osc = ctx.createOscillator();
+    const amp = ctx.createGain();
+    let node = osc;
+    osc.type = preset.type;
+    osc.frequency.value = preset.freq;
+    if (preset.sweepTo) {
+      osc.frequency.exponentialRampToValueAtTime(preset.sweepTo, ctx.currentTime + preset.duration);
+    }
+    if (preset.lowpass) {
+      const filter = ctx.createBiquadFilter();
+      filter.type = "lowpass";
+      filter.frequency.value = preset.lowpass;
+      osc.connect(filter);
+      node = filter;
+    }
+    amp.gain.value = 0;
+    amp.gain.linearRampToValueAtTime(preset.gain * fxVolume, ctx.currentTime + 0.03);
+    amp.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + preset.duration);
+    node.connect(amp);
+    amp.connect(ctx.destination);
+    osc.start();
+    osc.stop(ctx.currentTime + preset.duration + 0.05);
+  }
+
+  function playCompleteMelody(index) {
+    if (fxVolume === 0) return;
+    const melody = completeMelodies[index % completeMelodies.length];
+    const noteGap = 96;
+    melody.forEach((noteIndex, idx) => {
+      setTimeout(() => playTestSound(noteIndex), idx * noteGap);
+    });
+  }
+
+  function playSelectedRotate() {
+    playTestSound(rotateSoundIndex);
+  }
+
+  function playSelectedComplete() {
+    playCompleteMelody(completeSoundIndex);
+  }
+
+  function startAmbient(forcedPos) {
+    if (bgVolume == 0) return;
+    if (bgQueue.length === 0) return;
+    const position = typeof forcedPos === "number" ? forcedPos : bgQueuePos;
+    const trackIndex = bgQueue[position] ?? 0;
+    setBgNowPlayingIndex(trackIndex);
+    const track = audioTracks[trackIndex];
+    const audio = new Audio(track.file);
+    audio.loop = false;
+    audio.volume = 1;
+
+    const ctx = ensureAudioContext();
+    const source = ctx.createMediaElementSource(audio);
+    const gain = ctx.createGain();
+    gain.gain.value = Math.min(1.0, bgVolume * 0.4);
+    source.connect(gain);
+    gain.connect(ctx.destination);
+
+    audio.onended = () => playNextBg();
+    audio.play().catch(() => {});
+    bgAudioRef.current = audio;
+    bgSourceRef.current = source;
+    bgGainRef.current = gain;
+  }
+
+  function stopAmbient() {
+    if (!bgAudioRef.current) return;
+    bgAudioRef.current.pause();
+    bgAudioRef.current.currentTime = 0;
+    if (bgSourceRef.current) bgSourceRef.current.disconnect();
+    if (bgGainRef.current) bgGainRef.current.disconnect();
+    bgAudioRef.current = null;
+    bgSourceRef.current = null;
+    bgGainRef.current = null;
+  }
+
+  function playNextBg() {
+    if (bgQueue.length === 0) return;
+    const nextPos = (bgQueuePos + 1) % bgQueue.length;
+    setBgQueuePos(nextPos);
+    stopAmbient();
+    startAmbient(nextPos);
+  }
+
+  function playPrevBg() {
+    if (bgQueue.length === 0) return;
+    const prevPos = (bgQueuePos - 1 + bgQueue.length) % bgQueue.length;
+    setBgQueuePos(prevPos);
+    stopAmbient();
+    startAmbient(prevPos);
+  }
+
+  useEffect(() => {
+    if (bgVolume > 0 && bgQueue.length > 0 && !bgAudioRef.current) {
+      startAmbient();
+    }
+    return () => stopAmbient();
+  }, [bgQueue]);
+
+  useEffect(() => {
+    if (!bgAudioRef.current) {
+      startAmbient();
+      return;
+    }
+    if (bgGainRef.current) {
+      bgGainRef.current.gain.value = Math.min(1.0, bgVolume * 0.4);
+    }
+  }, [bgVolume]);
+
+  useEffect(() => {
+    const handleFirstInteraction = () => {
+      ensureAudioReady();
+      window.removeEventListener("pointerdown", handleFirstInteraction);
+    };
+    window.addEventListener("pointerdown", handleFirstInteraction);
+    return () => window.removeEventListener("pointerdown", handleFirstInteraction);
+  }, []);
+
+  const solved = useMemo(
+    () => tiles.every((t) => t.rotation === t.targetRotation),
+    [tiles]
+  );
+
+  function regenerate(nextSeed) {
+    setTiles(makeBoard(nextSeed));
+  }
+
+  function handleSeedChange(e) {
+    const nextSeed = e.target.value;
+    setSeedText(nextSeed);
+    regenerate(nextSeed);
+  }
+
+  function rotateTile(index) {
+    hasInteractedRef.current = true;
+    const next = [...tiles];
+    const tile = { ...next[index] };
+    const prevRotationDegrees = tile.rotationDegrees ?? tile.rotation * 90;
+    tile.rotation = (tile.rotation + 1) % 4;
+    tile.rotationDegrees = prevRotationDegrees + 90;
+    next[index] = tile;
+
+    const nextConnections = computeConnections(next);
+    const nextComplete = computeCompleteDirs(next, nextConnections);
+    let hasNewComplete = false;
+    next.forEach((nextTile) => {
+      const dirs = nextComplete.get(nextTile.id) || [false, false, false, false];
+      const bits = connectionBitmask(dirs);
+      const prevBits = prevCompleteBitsRef.current.get(nextTile.id) || 0;
+      if ((bits & ~prevBits) !== 0) {
+        hasNewComplete = true;
+      }
+    });
+
+    setTiles(next);
+    if (!hasNewComplete) {
+      playSelectedRotate();
+    }
+  }
+
+  return (
+    <div className="app">
+      <header className="top-controls">
+        <div className="footer-controls">
+          <div className="footer-left">
+            <button
+              type="button"
+              className="button"
+              onClick={() => regenerate(seedText)}
+            >
+              Reset
+            </button>
+            <button
+              type="button"
+              className="button button-ghost"
+              onClick={() => {
+                const nextSeed = Math.random().toString(36).slice(2, 8);
+                setSeedText(nextSeed);
+                regenerate(nextSeed);
+              }}
+            >
+              Random
+            </button>
+          </div>
+          <div className="footer-right">
+            <button
+              type="button"
+              className="button button-ghost button-icon"
+              onClick={() => setShowAttribution(true)}
+              aria-label="Attribution"
+              title="Attribution"
+            >
+              i
+            </button>
+            <button
+              type="button"
+              className="button button-ghost button-icon"
+              onClick={() =>
+                setBgVolume((prev) => (prev === 1 ? 0 : prev === 0 ? 0.3 : prev === 0.3 ? 0.6 : 1))
+              }
+              aria-label="Background volume"
+              title="Background volume"
+            >
+              <span>BG</span>
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M4 9h3l4-3v12l-4-3H4z" fill="currentColor" />
+                {bgVolume >= 0.3 ? (
+                  <path
+                    d="M15 11a2 2 0 010 2"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.8"
+                    strokeLinecap="round"
+                  />
+                ) : null}
+                {bgVolume >= 0.6 ? (
+                  <path
+                    d="M16.5 9.5a4 4 0 010 5"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.8"
+                    strokeLinecap="round"
+                  />
+                ) : null}
+                {bgVolume >= 1 ? (
+                  <path
+                    d="M18 7.5a6 6 0 010 9"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.8"
+                    strokeLinecap="round"
+                  />
+                ) : null}
+              </svg>
+            </button>
+            <button
+              type="button"
+              className="button button-ghost button-icon"
+              onClick={() =>
+                setFxVolume((prev) => (prev === 1.5 ? 0 : prev === 0 ? 0.5 : prev === 0.5 ? 1.0 : 1.5))
+              }
+              aria-label="Effects volume"
+              title="Effects volume"
+            >
+              <span>FX</span>
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M4 9h3l4-3v12l-4-3H4z" fill="currentColor" />
+                {fxVolume >= 0.5 ? (
+                  <path
+                    d="M15 11a2 2 0 010 2"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.8"
+                    strokeLinecap="round"
+                  />
+                ) : null}
+                {fxVolume >= 1.0 ? (
+                  <path
+                    d="M16.5 9.5a4 4 0 010 5"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.8"
+                    strokeLinecap="round"
+                  />
+                ) : null}
+                {fxVolume >= 1.5 ? (
+                  <path
+                    d="M18 7.5a6 6 0 010 9"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.8"
+                    strokeLinecap="round"
+                  />
+                ) : null}
+              </svg>
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <main className="board-wrap">
+        <div
+          className="board"
+          style={{
+            "--cols": COLS,
+            "--rows": ROWS,
+            gridTemplateColumns: `repeat(${COLS}, var(--tile-size))`,
+            gridTemplateRows: `repeat(${ROWS}, var(--tile-size))`
+          }}
+        >
+          {tiles.map((tile, index) => (
+            <Tile
+              key={tile.id}
+              tile={{
+                ...tile,
+                connectionFlash: connectionFlashIds.has(tile.id),
+                completeDirs: completeDirs.get(tile.id)
+              }}
+              onRotate={() => rotateTile(index)}
+            />
+          ))}
+        </div>
+      </main>
+
+      {solved ? <p className="status-text">Complete. Breathe.</p> : null}
+      {/* Sound testing UI hidden */}
+      {showAttribution ? (
+        <div className="modal-backdrop" onClick={() => setShowAttribution(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <h2 className="modal-title">Music</h2>
+            <div className="player-card">
+              <p className="player-label">Now Playing</p>
+              <p className="player-title">
+                {audioTracks[bgNowPlayingIndex]?.title || "—"}
+              </p>
+              <div className="player-controls">
+                <button type="button" className="player-button" onClick={playPrevBg} aria-label="Previous track">
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M7 6v12M19 6l-8 6 8 6" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                </button>
+                <button
+                  type="button"
+                  className="player-button player-button-main"
+                  onClick={() => {
+                    if (bgAudioRef.current) {
+                      if (bgAudioRef.current.paused) bgAudioRef.current.play().catch(() => {});
+                      else bgAudioRef.current.pause();
+                    }
+                  }}
+                  aria-label={bgAudioRef.current?.paused ? "Play" : "Pause"}
+                >
+                  {bgAudioRef.current?.paused ? (
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M8 6l10 6-10 6z" fill="currentColor" />
+                    </svg>
+                  ) : (
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M8 6h3v12H8zM13 6h3v12h-3z" fill="currentColor" />
+                    </svg>
+                  )}
+                </button>
+                <button type="button" className="player-button" onClick={playNextBg} aria-label="Next track">
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M17 6v12M5 6l8 6-8 6" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+            <p className="modal-subtitle">Attribution</p>
+            <div className="modal-list">
+              {audioAttribution.map((item) => (
+                <p key={item.source} className="modal-item">
+                  {item.source} — {item.license} (
+                  <a className="modal-link" href={item.url} target="_blank" rel="noreferrer">
+                    source
+                  </a>
+                  )
+                </p>
+              ))}
+            </div>
+            <button
+              type="button"
+              className="button"
+              onClick={() => setShowAttribution(false)}
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}

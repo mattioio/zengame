@@ -258,6 +258,12 @@ function makeBoard(seedText, difficulty = "medium") {
     hard: { min: 0, max: 0, clusters: 0, minClusterCells: 0, maxEmptyRowRun: 0, maxEmptyColRun: 0 }
   };
   const config = difficultyConfig[difficulty] || difficultyConfig.medium;
+  const curveRatioByDifficulty = {
+    easy: 0.32,
+    medium: 0.28,
+    hard: 0.24
+  };
+  const curveRatio = curveRatioByDifficulty[difficulty] ?? 0.28;
   const minTerminals = Math.max(6, Math.floor((ROWS * COLS) * 0.12));
   const maxTerminals = Math.max(minTerminals + 2, Math.floor((ROWS * COLS) * 0.22));
   const maxStraightRunAllowed = 4;
@@ -286,13 +292,16 @@ function makeBoard(seedText, difficulty = "medium") {
     const tooClustered = hasCloseTerminals(edgesByCell, ROWS, COLS, minTerminalDistance);
     const terminalClusterSize = maxTerminalCluster(edgesByCell, ROWS, COLS);
     const edgeConnected = isEdgeGraphConnected(edgesByCell, ROWS, COLS);
+    const { curves, nonBlank } = countCurves(edgesByCell, ROWS, COLS);
+    const minCurves = nonBlank === 0 ? 0 : Math.max(8, Math.round(nonBlank * curveRatio));
     if (
       terminals >= minTerminals &&
       terminals <= maxTerminals &&
       longestRun <= maxStraightRunAllowed &&
       !tooClustered &&
       terminalClusterSize <= maxTerminalClusterAllowed &&
-      edgeConnected
+      edgeConnected &&
+      curves >= minCurves
     ) {
       break;
     }
@@ -438,13 +447,13 @@ function generateSolvedEdges(rows, cols, rand) {
   const visited = new Set();
   const stack = [];
 
-  const start = [0, 0];
+  const start = [0, 0, null];
   stack.push(start);
-  visited.add(start.join("-"));
-  edgesByCell.set(start.join("-"), [false, false, false, false]);
+  visited.add(`${start[0]}-${start[1]}`);
+  edgesByCell.set(`${start[0]}-${start[1]}`, [false, false, false, false]);
 
   while (stack.length) {
-    const [r, c] = stack[stack.length - 1];
+    const [r, c, prevDir] = stack[stack.length - 1];
     const neighbors = [];
     if (r > 0 && !visited.has(`${r - 1}-${c}`)) neighbors.push([r - 1, c, 0]);
     if (c < cols - 1 && !visited.has(`${r}-${c + 1}`)) neighbors.push([r, c + 1, 1]);
@@ -456,8 +465,18 @@ function generateSolvedEdges(rows, cols, rand) {
       continue;
     }
 
-    const nextIndex = Math.floor(rand() * neighbors.length);
-    const [nr, nc, dir] = neighbors[nextIndex];
+    let nextNeighbor = null;
+    if (prevDir !== null && prevDir !== undefined) {
+      const turnDirs = new Set([(prevDir + 1) % 4, (prevDir + 3) % 4]);
+      const turnNeighbors = neighbors.filter((neighbor) => turnDirs.has(neighbor[2]));
+      if (turnNeighbors.length > 0 && rand() < 0.85) {
+        nextNeighbor = turnNeighbors[Math.floor(rand() * turnNeighbors.length)];
+      }
+    }
+    if (!nextNeighbor) {
+      nextNeighbor = neighbors[Math.floor(rand() * neighbors.length)];
+    }
+    const [nr, nc, dir] = nextNeighbor;
     const currentKey = `${r}-${c}`;
     const nextKey = `${nr}-${nc}`;
 
@@ -469,7 +488,7 @@ function generateSolvedEdges(rows, cols, rand) {
     edgesByCell.set(nextKey, nextEdges);
 
     visited.add(nextKey);
-    stack.push([nr, nc]);
+    stack.push([nr, nc, dir]);
   }
 
   // Add extra edges to create cycles / higher-degree nodes (crosses).
@@ -757,6 +776,24 @@ function countTerminals(edgesByCell, rows, cols) {
     }
   }
   return count;
+}
+
+function countCurves(edgesByCell, rows, cols) {
+  let curves = 0;
+  let nonBlank = 0;
+  for (let r = 0; r < rows; r += 1) {
+    for (let c = 0; c < cols; c += 1) {
+      const edges = edgesByCell.get(`${r}-${c}`) || [false, false, false, false];
+      const degree = edges.filter(Boolean).length;
+      if (degree === 0) continue;
+      nonBlank += 1;
+      if (degree === 2) {
+        const isStraight = (edges[0] && edges[2]) || (edges[1] && edges[3]);
+        if (!isStraight) curves += 1;
+      }
+    }
+  }
+  return { curves, nonBlank };
 }
 
 function isEdgeGraphConnected(edgesByCell, rows, cols) {
@@ -1062,23 +1099,24 @@ function Tile({ tile, onRotate }) {
     (4 - tile.rotation) % 4
   );
   const isTileComplete = localCompleteDirs.some(Boolean);
-  const faceStyle = {};
+  const tileStyle = {};
   if (typeof tile.pulseDelay === "number") {
-    faceStyle["--pulse-delay"] = `${tile.pulseDelay}ms`;
+    tileStyle["--pulse-delay"] = `${tile.pulseDelay}ms`;
   }
   if (typeof tile.waveDelay === "number") {
-    faceStyle["--wave-delay"] = `${tile.waveDelay}ms`;
+    tileStyle["--wave-delay"] = `${tile.waveDelay}ms`;
   }
-  const faceStyleProps = Object.keys(faceStyle).length > 0 ? faceStyle : undefined;
+  const tileStyleProps = Object.keys(tileStyle).length > 0 ? tileStyle : undefined;
   return (
     <button
       type="button"
       className={`tile ${tile.type === "blank" ? "tile-blank" : ""} ${isTileComplete ? "tile-complete" : ""} ${typeof tile.pulseDelay === "number" ? "tile-pulse" : ""} ${tile.waveActive ? "tile-wave" : ""}`}
       onClick={onRotate}
+      style={tileStyleProps}
       aria-label={`Tile ${tile.r + 1}, ${tile.c + 1}`}
       disabled={tile.type === "blank"}
     >
-      <span className="tile-face" style={faceStyleProps} />
+      <span className="tile-face" />
       <div
         className="tile-graphic"
         style={{ transform: `rotate(${tile.rotationDegrees}deg)` }}
@@ -1773,19 +1811,23 @@ export default function App() {
 
   useEffect(() => {
     if (solved && !prevSolvedRef.current) {
+      const step = 180;
+      const groupSize = 2;
+      const delays = new Map();
+      let maxDelay = 0;
+      tiles.forEach((tile) => {
+        const groupIndex = Math.floor(tile.r / groupSize);
+        const delay = groupIndex * step;
+        delays.set(tile.id, delay);
+        if (delay > maxDelay) maxDelay = delay;
+      });
+
       const startWave = () => {
-        const delays = new Map();
-        const step = 180;
-        const groupSize = 2;
-        tiles.forEach((tile) => {
-          const groupIndex = Math.floor(tile.r / groupSize);
-          delays.set(tile.id, groupIndex * step);
-        });
         setWaveDelays(delays);
         setWaveActive(true);
         setSolvedDim(false);
         playWaveMelodyAscending();
-        const total = (Math.ceil(ROWS / groupSize) - 1) * step + 700;
+        const total = maxDelay + 700;
         waveEndTimeoutRef.current = window.setTimeout(() => {
           setWaveActive(false);
           setSolvedDim(true);
@@ -1919,14 +1961,7 @@ export default function App() {
         const step = base - (base - min) * eased;
         delays.set(id, dist * step);
       });
-      const isFullyCompletePath = Array.from(component).every((id) => {
-        const tileObj = byPos.get(id);
-        if (!tileObj) return false;
-        const edges = getEdges(tileObj);
-        const completeDirs = nextComplete.get(id) || [false, false, false, false];
-        return edges.every((hasEdge, dir) => !hasEdge || completeDirs[dir]);
-      });
-      if (delays.size > 0 && isFullyCompletePath) {
+      if (delays.size > 0) {
         setPulseDelays(delays);
         const endStep = base - (base - min);
         const pulseDuration = maxDist * endStep + 260;
@@ -2108,7 +2143,9 @@ export default function App() {
               type="button"
               className="button button-ghost button-icon"
               onClick={() =>
-                setFxVolume((prev) => (prev === 1.6 ? 0 : prev === 0 ? 0.6 : prev === 0.6 ? 1.2 : 1.6))
+                setFxVolume((prev) =>
+                  prev === 2.5 ? 0 : prev === 1.6 ? 2.5 : prev === 0 ? 0.6 : prev === 0.6 ? 1.2 : 2.5
+                )
               }
               aria-label="Effects volume"
               title="Effects volume"
@@ -2136,7 +2173,7 @@ export default function App() {
                     strokeOpacity="0.75"
                   />
                 ) : null}
-                {fxVolume >= 1.6 ? (
+                {fxVolume >= 2.5 ? (
                   <path
                     d="M17.5 6a6.5 6.5 0 010 12"
                     fill="none"
@@ -2252,12 +2289,15 @@ export default function App() {
                 : themes[themeIndex]?.name || "Theme"}
             </span>
             <span className="theme-swatches">
-              {(themeMode === "random"
-                ? []
-                : (themes[themeIndex]?.colors || themes[0].colors).slice(0, 3)
-              ).map((color) => (
-                <span key={color} className="theme-swatch" style={{ background: color }} />
-              ))}
+              {themeMode === "random" ? (
+                <span className="theme-swatch theme-swatch-random" />
+              ) : (
+                (themes[themeIndex]?.colors || themes[0].colors)
+                  .slice(0, 1)
+                  .map((color) => (
+                    <span key={color} className="theme-swatch" style={{ background: color }} />
+                  ))
+              )}
             </span>
           </div>
           <button
@@ -2287,6 +2327,9 @@ export default function App() {
               }}
             >
               <span className="theme-label">Random</span>
+              <span className="theme-swatches">
+                <span className="theme-swatch theme-swatch-random" />
+              </span>
             </button>
             {themes.map((theme, index) => (
               <button
@@ -2305,7 +2348,7 @@ export default function App() {
               >
                 <span className="theme-label">{theme.name}</span>
                 <span className="theme-swatches">
-                  {theme.colors.slice(0, 3).map((color) => (
+                  {theme.colors.slice(0, 1).map((color) => (
                     <span key={color} className="theme-swatch" style={{ background: color }} />
                   ))}
                 </span>

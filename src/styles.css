@@ -211,7 +211,7 @@ body.perf-mode::before {
 }
 @keyframes confetti-fall {
   0% { transform: translateX(var(--confetti-drift, 0px)) translateY(-30%) rotate(var(--confetti-rotate, 0deg)); opacity: 1; }
-  100% { transform: translateX(calc(var(--confetti-drift, 0px) * -0.4)) translateY(230%) rotate(calc(var(--confetti-rotate, 0deg) + 200deg)); opacity: 0; }
+  100% { transform: translateX(calc(var(--confetti-drift, 0px) * -0.4)) translateY(920%) rotate(calc(var(--confetti-rotate, 0deg) + 200deg)); opacity: 0; }
 }
 
 .top-controls {
@@ -352,6 +352,15 @@ body.perf-mode::before {
   gap: 12px;
 }
 
+.theme-button:focus {
+  outline: none;
+}
+
+.theme-button:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px #0b5bd3, 0 0 0 6px rgba(255, 255, 255, 0.8);
+}
+
 .theme-button:hover {
   color: var(--accent);
   background: rgba(255, 255, 255, 0.85);
@@ -397,10 +406,25 @@ body.perf-mode::before {
 }
 
 .theme-swatch {
-  width: 18px;
-  height: 18px;
-  border-radius: 6px;
+  width: 1.5rem;
+  height: 1.5rem;
+  border-radius: 0.55rem;
   border: 1px solid rgba(0, 0, 0, 0.12);
+  position: relative;
+  overflow: hidden;
+  background-clip: padding-box;
+}
+
+.theme-swatch-random {
+  background: conic-gradient(
+    from 225deg,
+    #f6d6a9 0%,
+    #f6d6a9 35%,
+    #c8e6c9 35%,
+    #d6dacb 65%,
+    #f8bcd1 65%,
+    #f8bcd1 100%
+  );
 }
 
 .label {
@@ -658,6 +682,7 @@ body.perf-mode::before {
   }
 }
 
+
 .tile-wave .tile-face {
   animation: tile-wave 900ms cubic-bezier(0.22, 0.61, 0.36, 1) both;
   animation-delay: var(--wave-delay, 0ms);
@@ -669,6 +694,8 @@ body.perf-mode::before {
 
 .tile-blank.tile-wave .tile-face {
   animation-name: tile-wave-blank;
+  animation-duration: 1000ms;
+  animation-timing-function: cubic-bezier(0.2, 0.7, 0.2, 1);
 }
 
 @keyframes tile-wave {
@@ -688,16 +715,19 @@ body.perf-mode::before {
 
 @keyframes tile-wave-blank {
   0% {
-    transform: scale(1);
-    background: rgba(255, 255, 255, 0.1);
+    transform: scale(0.96);
+    background: rgba(255, 255, 255, 0.08);
+    opacity: 0.45;
   }
-  40% {
-    transform: scale(1.06);
-    background: rgba(255, 255, 255, 0.1);
+  45% {
+    transform: scale(1.03);
+    background: rgba(255, 255, 255, 0.32);
+    opacity: 0.85;
   }
   100% {
     transform: scale(1);
     background: var(--tile-solved-bg);
+    opacity: 1;
   }
 }
 
@@ -1025,6 +1055,7 @@ body.perf-mode::before {
   opacity: 1;
   transform: translateY(0);
   grid-template-columns: repeat(2, minmax(0, 1fr));
+  overflow: visible;
   pointer-events: auto;
   visibility: visible;
   margin-top: 6px;
@@ -1140,6 +1171,10 @@ body.perf-mode::before {
 
 .app.is-perf .success-overlay {
   backdrop-filter: none;
+}
+
+.app.is-perf {
+  --board-bg: rgba(255, 255, 255, 0.6);
 }
 
 .app.is-perf .success-confetti {

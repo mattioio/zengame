@@ -667,6 +667,10 @@ body.perf-mode::before {
   animation-name: tile-wave-complete;
 }
 
+.tile-blank.tile-wave .tile-face {
+  animation-name: tile-wave-blank;
+}
+
 @keyframes tile-wave {
   0% {
     transform: scale(1);
@@ -675,6 +679,21 @@ body.perf-mode::before {
   40% {
     transform: scale(1.06);
     background: var(--tile-bg);
+  }
+  100% {
+    transform: scale(1);
+    background: var(--tile-solved-bg);
+  }
+}
+
+@keyframes tile-wave-blank {
+  0% {
+    transform: scale(1);
+    background: rgba(255, 255, 255, 0.1);
+  }
+  40% {
+    transform: scale(1.06);
+    background: rgba(255, 255, 255, 0.1);
   }
   100% {
     transform: scale(1);
@@ -1137,6 +1156,11 @@ body.perf-mode::before {
   animation: none;
 }
 
+.app.is-perf .success-card,
+.app.is-perf .success-icon {
+  opacity: 1;
+}
+
 .app.is-perf .board-wrap,
 .app.is-perf .player-card,
 .app.is-perf .theme-panel-card,
@@ -1177,6 +1201,11 @@ body.perf-mode::before {
   .success-icon,
   .success-diamond {
     animation: none !important;
+  }
+
+  .success-card,
+  .success-icon {
+    opacity: 1;
   }
 
   .tile,

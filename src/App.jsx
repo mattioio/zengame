@@ -1242,7 +1242,6 @@ export default function App() {
   });
   const [showThemePicker, setShowThemePicker] = useState(false);
   const [themePickerMounted, setThemePickerMounted] = useState(false);
-  const [randomSwatchOffset, setRandomSwatchOffset] = useState(0);
   const initialDifficultyIndex = (() => {
     const savedDifficulty = localStorage.getItem("zen_difficulty");
     const idx = difficultyLevels.indexOf(savedDifficulty);
@@ -1251,7 +1250,11 @@ export default function App() {
   const [difficultyIndex, setDifficultyIndex] = useState(initialDifficultyIndex);
   const initialSeed = useMemo(() => Math.random().toString(36).slice(2, 8), []);
   const [seedText, setSeedText] = useState(initialSeed);
-  const initialTiles = makeBoard(initialSeed, difficultyLevels[initialDifficultyIndex]);
+  const initialDifficulty = difficultyLevels[initialDifficultyIndex];
+  const initialTiles = useMemo(
+    () => makeBoard(initialSeed, initialDifficulty),
+    [initialSeed, initialDifficulty]
+  );
   const [tiles, setTiles] = useState(initialTiles);
   const [initialRotations, setInitialRotations] = useState(() =>
     initialTiles.map((tile) => tile.rotation)
@@ -1272,6 +1275,9 @@ export default function App() {
   const [showAttribution, setShowAttribution] = useState(false);
   const [showSuccess, setShowSuccess] = useState(false);
   const [successMessage, setSuccessMessage] = useState("Well done");
+  const [performanceMode, setPerformanceMode] = useState(
+    () => localStorage.getItem("zen_performance_mode") === "on"
+  );
   const initialRecentRandomThemes = useMemo(() => {
     try {
       const raw = localStorage.getItem("zen_recent_random_themes");
@@ -1375,8 +1381,15 @@ export default function App() {
   }, [fxVolume]);
 
   useEffect(() => {
-    document.documentElement.style.setProperty("--page-noise", String(boardNoise));
-  }, [boardNoise]);
+    const noise = performanceMode ? 0 : boardNoise;
+    document.documentElement.style.setProperty("--page-noise", String(noise));
+  }, [boardNoise, performanceMode]);
+
+  useEffect(() => {
+    localStorage.setItem("zen_performance_mode", performanceMode ? "on" : "off");
+    document.body.classList.toggle("perf-mode", performanceMode);
+    return () => document.body.classList.remove("perf-mode");
+  }, [performanceMode]);
 
   useEffect(() => {
     localStorage.setItem("zen_theme_mode", themeMode);
@@ -1404,14 +1417,6 @@ export default function App() {
     recentRandomThemesRef.current = [];
     localStorage.removeItem("zen_recent_random_themes");
   };
-
-  useEffect(() => {
-    if (themeMode !== "random") return undefined;
-    const interval = setInterval(() => {
-      setRandomSwatchOffset((prev) => (prev + 1) % themes.length);
-    }, 1100);
-    return () => clearInterval(interval);
-  }, [themeMode, themes.length]);
 
   useEffect(() => {
     localStorage.setItem("zen_difficulty", difficultyLevels[difficultyIndex]);
@@ -1973,8 +1978,14 @@ export default function App() {
     }
   };
 
+  const confettiCount = performanceMode ? 40 : 120;
+
   return (
-    <div className={`app${solvedDim ? " is-solved" : ""}${showSuccess ? " show-success" : ""}`}>
+    <div
+      className={`app${solvedDim ? " is-solved" : ""}${showSuccess ? " show-success" : ""}${
+        performanceMode ? " is-perf" : ""
+      }`}
+    >
       <header className="top-controls">
         <h1 className="app-title">
           ZENT
@@ -2145,7 +2156,7 @@ export default function App() {
         {showSuccess ? (
           <div className="success-overlay">
             <div className="success-confetti">
-              {Array.from({ length: 120 }).map((_, idx) => {
+              {Array.from({ length: confettiCount }).map((_, idx) => {
                 const palette = themes[themeIndex]?.colors || themes[0].colors;
                 const color = palette[idx % palette.length];
                 const size = 6 + (idx % 5) * 3 + (idx % 2);
@@ -2346,6 +2357,22 @@ export default function App() {
               <svg viewBox="0 0 24 24" aria-hidden="true">
                 <path d="M17 6v12M5 6l8 6-8 6" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
               </svg>
+            </button>
+          </div>
+        </div>
+        <div className="performance-card theme-panel-card">
+          <div className="perf-row">
+            <div className="perf-copy">
+              <p className="perf-label">Performance</p>
+              <p className="perf-note">Optimize motion + visuals for mobile.</p>
+            </div>
+            <button
+              type="button"
+              className={`button button-ghost perf-toggle${performanceMode ? " is-active" : ""}`}
+              onClick={() => setPerformanceMode((prev) => !prev)}
+              aria-pressed={performanceMode}
+            >
+              {performanceMode ? "On" : "Off"}
             </button>
           </div>
         </div>

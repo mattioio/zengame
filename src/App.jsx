@@ -1,10 +1,150 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { useRegisterSW } from "virtual:pwa-register/react";
 import { audioAttribution, audioTracks } from "./audioManifest.js";
+import loreAndOrderLogo from "./assets/loreandorder.svg";
+import bakedProgressionLevels from "./progressionLevels.json";
 
 const ROWS = 10;
 const COLS = 6;
+const TOTAL_LEVELS = 96;
+const MIN_TILES = 4;
 
 const TILE_TYPES = ["blank", "terminal", "straight", "curveLeft", "curveRight", "tJunction"];
+
+const PROGRESSION_SETTINGS_RANGES = {
+  gapRate: { min: 0, max: 96 },
+  gapClusters: { min: 0, max: 4 },
+  curveBias: { min: 20, max: 40 },
+  terminalRate: { min: 12, max: 24 },
+  terminalSpacing: { min: 1, max: 5 },
+  straightRunMax: { min: 2, max: 6 },
+  emptyRowMax: { min: 0, max: 5 },
+  emptyColMax: { min: 0, max: 5 },
+  centerBias: { min: 0, max: 100 },
+  variant: { min: 0, max: 9 }
+};
+
+const DEFAULT_PROGRESSION_SETTINGS = {
+  gapRate: 18,
+  gapClusters: 2,
+  curveBias: 28,
+  terminalRate: 18,
+  terminalSpacing: 2,
+  straightRunMax: 4,
+  emptyRowMax: 2,
+  emptyColMax: 2,
+  centerBias: 0,
+  variant: 0
+};
+
+function clampValue(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function normalizeProgressionSettings(settings) {
+  const next = { ...DEFAULT_PROGRESSION_SETTINGS };
+  if (!settings || typeof settings !== "object") return next;
+  Object.entries(PROGRESSION_SETTINGS_RANGES).forEach(([key, range]) => {
+    const raw = Number(settings[key]);
+    if (Number.isFinite(raw)) {
+      next[key] = clampValue(Math.round(raw), range.min, range.max);
+    }
+  });
+  return next;
+}
+
+function normalizeLevelList(list) {
+  const source = Array.isArray(list)
+    ? list
+    : list && typeof list === "object" && Array.isArray(list.levels)
+      ? list.levels
+      : [];
+  return Array.from({ length: TOTAL_LEVELS }, (_, index) => {
+    const value = source[index];
+    return typeof value === "string" ? value : "";
+  });
+}
+
+function buildProgressionSeed(settings) {
+  const normalized = normalizeProgressionSettings(settings);
+  return `P${normalized.gapRate}-${normalized.gapClusters}-${normalized.curveBias}-${normalized.terminalRate}-${normalized.straightRunMax}-${normalized.terminalSpacing}-${normalized.emptyRowMax}-${normalized.emptyColMax}-${normalized.centerBias}-${normalized.variant}`;
+}
+
+function parseProgressionSeed(seedText) {
+  if (!seedText || typeof seedText !== "string") return null;
+  const match = seedText.match(/^P(\d+)-(\d+)-(\d+)-(\d+)-(\d+)-(\d+)-(\d+)-(\d+)-(\d+)-(\d+)$/i);
+  if (match) {
+    return normalizeProgressionSettings({
+      gapRate: Number(match[1]),
+      gapClusters: Number(match[2]),
+      curveBias: Number(match[3]),
+      terminalRate: Number(match[4]),
+      straightRunMax: Number(match[5]),
+      terminalSpacing: Number(match[6]),
+      emptyRowMax: Number(match[7]),
+      emptyColMax: Number(match[8]),
+      centerBias: Number(match[9]),
+      variant: Number(match[10])
+    });
+  }
+  const legacyMatch = seedText.match(/^P(\d+)-(\d+)-(\d+)-(\d+)-(\d+)-(\d+)-(\d+)-(\d+)-(\d+)$/i);
+  if (legacyMatch) {
+    return normalizeProgressionSettings({
+      gapRate: Number(legacyMatch[1]),
+      gapClusters: Number(legacyMatch[2]),
+      curveBias: Number(legacyMatch[3]),
+      terminalRate: Number(legacyMatch[4]),
+      straightRunMax: Number(legacyMatch[5]),
+      terminalSpacing: Number(legacyMatch[6]),
+      emptyRowMax: Number(legacyMatch[7]),
+      emptyColMax: Number(legacyMatch[8]),
+      variant: Number(legacyMatch[9])
+    });
+  }
+  const legacyMatchShort = seedText.match(/^P(\d+)-(\d+)-(\d+)-(\d+)-(\d+)-(\d+)$/i);
+  if (!legacyMatchShort) return null;
+  return normalizeProgressionSettings({
+    gapRate: Number(legacyMatchShort[1]),
+    gapClusters: Number(legacyMatchShort[2]),
+    curveBias: Number(legacyMatchShort[3]),
+    terminalRate: Number(legacyMatchShort[4]),
+    straightRunMax: Number(legacyMatchShort[5]),
+    variant: Number(legacyMatchShort[6])
+  });
+}
+
+function progressionSettingsToBoardConfig(settings) {
+  const normalized = normalizeProgressionSettings(settings);
+  const totalCells = ROWS * COLS;
+  const gapCellsRaw = Math.round((totalCells * normalized.gapRate) / 100);
+  const maxBlankCells = Math.max(0, totalCells - MIN_TILES);
+  const maxBlankCellsSnapped = Math.floor(maxBlankCells / 4) * 4;
+  const gapCells = Math.min(
+    maxBlankCellsSnapped,
+    Math.max(0, Math.round(gapCellsRaw / 4) * 4)
+  );
+  const clusters = gapCells === 0 ? 0 : normalized.gapClusters;
+  const minClusterCells = clusters === 0 ? 0 : 4 + clusters * 2;
+  const minTerminals = Math.max(4, Math.round((totalCells * normalized.terminalRate) / 100));
+  const maxTerminals = Math.min(totalCells, minTerminals + 6);
+  return {
+    blanks: {
+      min: gapCells,
+      max: gapCells,
+      clusters,
+      minClusterCells,
+      maxEmptyRowRun: normalized.emptyRowMax,
+      maxEmptyColRun: normalized.emptyColMax,
+      centerBias: normalized.centerBias / 100
+    },
+    curveRatio: normalized.curveBias / 100,
+    minTerminals,
+    maxTerminals,
+    maxStraightRunAllowed: normalized.straightRunMax,
+    minTerminalDistance: normalized.terminalSpacing,
+    maxTerminalClusterAllowed: 3
+  };
+}
 
 function hashStringToInt(str) {
   let h = 2166136261;
@@ -57,10 +197,10 @@ function applySymmetricBlanks(
   clusterCount,
   minClusterCells = 0,
   maxEmptyRowRun = Infinity,
-  maxEmptyColRun = Infinity
+  maxEmptyColRun = Infinity,
+  centerBias = 0
 ) {
   if (targetCells <= 0) return;
-  const groupTarget = Math.max(1, Math.round(targetCells / 4));
   const gridRows = Math.ceil(rows / 2);
   const gridCols = Math.ceil(cols / 2);
   const groups = [];
@@ -76,6 +216,44 @@ function applySymmetricBlanks(
       indexGrid[r][c] = index;
     }
   }
+  const totalGroups = groups.length;
+  const maxBlankGroups = Math.max(0, totalGroups - 1);
+  const groupTarget = Math.min(
+    maxBlankGroups,
+    Math.max(1, Math.round(targetCells / 4))
+  );
+
+  const biasStrength = clampValue(centerBias, 0, 1);
+  const centerRow = (rows - 1) / 2;
+  const centerCol = (cols - 1) / 2;
+  const maxDist = Math.abs(centerRow) + Math.abs(centerCol) || 1;
+  const groupWeights = groups.map((group) => {
+    if (biasStrength <= 0) return 1;
+    const dist =
+      Math.abs(group.r - centerRow) + Math.abs(group.c - centerCol);
+    const normalized = dist / maxDist;
+    const power = 1 + biasStrength * 2.5;
+    const weighted = Math.pow(normalized, power);
+    return 1 + weighted * (1 + biasStrength * 8);
+  });
+
+  const pickWeightedIndex = (available) => {
+    if (available.length === 0) return -1;
+    if (biasStrength <= 0 || rand() > biasStrength) {
+      return available[Math.floor(rand() * available.length)];
+    }
+    let total = 0;
+    available.forEach((idx) => {
+      total += groupWeights[idx] ?? 1;
+    });
+    let roll = rand() * total;
+    for (let i = 0; i < available.length; i += 1) {
+      const idx = available[i];
+      roll -= groupWeights[idx] ?? 1;
+      if (roll <= 0) return idx;
+    }
+    return available[available.length - 1];
+  };
 
   const selectGroupsInClusters = (clusterCountValue) => {
     const minGroups = Math.max(1, Math.ceil(minClusterCells / 4));
@@ -85,14 +263,15 @@ function applySymmetricBlanks(
     const maxClusterTotal = Math.max(1, Math.floor(groupTarget / minGroups));
     const finalClusterTotal = Math.min(clusterTotal, maxClusterTotal);
     for (let i = 0; i < finalClusterTotal; i += 1) {
-      let seedIndex = Math.floor(rand() * groups.length);
-      let attempts = 0;
-      while (chosen.has(seedIndex) && attempts < 20) {
-        seedIndex = Math.floor(rand() * groups.length);
-        attempts += 1;
+      const available = [];
+      for (let idx = 0; idx < groups.length; idx += 1) {
+        if (!chosen.has(idx)) available.push(idx);
       }
-      chosen.add(seedIndex);
-      clusters.push([seedIndex]);
+      const seedIndex = pickWeightedIndex(available);
+      if (seedIndex >= 0) {
+        chosen.add(seedIndex);
+        clusters.push([seedIndex]);
+      }
     }
 
     const neighborIndices = (group) => {
@@ -127,13 +306,12 @@ function applySymmetricBlanks(
           continue;
         }
       } else {
-        let nextIndex = Math.floor(rand() * groups.length);
-        let attempts = 0;
-        while (chosen.has(nextIndex) && attempts < 50) {
-          nextIndex = Math.floor(rand() * groups.length);
-          attempts += 1;
+        const available = [];
+        for (let idx = 0; idx < groups.length; idx += 1) {
+          if (!chosen.has(idx)) available.push(idx);
         }
-        if (!chosen.has(nextIndex)) {
+        const nextIndex = pickWeightedIndex(available);
+        if (nextIndex >= 0) {
           chosen.add(nextIndex);
           cluster.push(nextIndex);
           if (cluster.length < minGroups) {
@@ -144,7 +322,7 @@ function applySymmetricBlanks(
         }
       }
     }
-    return Array.from(chosen).map((idx) => groups[idx].cells);
+    return Array.from(chosen);
   };
 
   const isConnected = (blankSet) => {
@@ -212,9 +390,57 @@ function applySymmetricBlanks(
   while (attempts < 40) {
     blanks = new Set();
     const grouped = selectGroupsInClusters(clusterCount);
-    for (const group of grouped) {
+    const blankGroups = new Set(grouped);
+    for (const groupIndex of grouped) {
       if (blanks.size >= groupTarget * 4) break;
-      group.forEach((key) => blanks.add(key));
+      groups[groupIndex].cells.forEach((key) => blanks.add(key));
+    }
+    if (
+      biasStrength >= 0.4 &&
+      blankGroups.size > 0 &&
+      blankGroups.size < totalGroups
+    ) {
+      const keepGroups = [];
+      for (let i = 0; i < totalGroups; i += 1) {
+        if (!blankGroups.has(i)) keepGroups.push(i);
+      }
+      const keepCount = keepGroups.length;
+      if (keepCount > 0) {
+        const sortedByCenter = Array.from({ length: totalGroups }, (_, idx) => idx).sort(
+          (a, b) => {
+            const da =
+              Math.abs(groups[a].r - centerRow) + Math.abs(groups[a].c - centerCol);
+            const db =
+              Math.abs(groups[b].r - centerRow) + Math.abs(groups[b].c - centerCol);
+            return da - db;
+          }
+        );
+        const desiredCount = Math.max(1, Math.round(keepCount * biasStrength));
+        const desiredSet = new Set(sortedByCenter.slice(0, desiredCount));
+        const missing = Array.from(desiredSet).filter((idx) => blankGroups.has(idx));
+        if (missing.length > 0) {
+          const removable = keepGroups
+            .filter((idx) => !desiredSet.has(idx))
+            .sort((a, b) => {
+              const da =
+                Math.abs(groups[a].r - centerRow) + Math.abs(groups[a].c - centerCol);
+              const db =
+                Math.abs(groups[b].r - centerRow) + Math.abs(groups[b].c - centerCol);
+              return db - da;
+            });
+          const swapCount = Math.min(missing.length, removable.length);
+          if (swapCount > 0) {
+            for (let i = 0; i < swapCount; i += 1) {
+              blankGroups.delete(missing[i]);
+              blankGroups.add(removable[i]);
+            }
+            blanks = new Set();
+            blankGroups.forEach((idx) => {
+              groups[idx].cells.forEach((key) => blanks.add(key));
+            });
+          }
+        }
+      }
     }
     const emptyRowRun = maxEmptyRun(blanks, "row");
     const emptyColRun = maxEmptyRun(blanks, "col");
@@ -252,39 +478,48 @@ function makeBoard(seedText, difficulty = "medium") {
   const seed = hashStringToInt(seedText || "zen");
   let rand = mulberry32(seed);
   let edgesByCell = null;
+  const progressionSettings = parseProgressionSeed(seedText);
+  const progressionConfig = progressionSettings
+    ? progressionSettingsToBoardConfig(progressionSettings)
+    : null;
   const difficultyConfig = {
     easy: { min: 13, max: 20, clusters: 3, minClusterCells: 6, maxEmptyRowRun: 2, maxEmptyColRun: 2 },
     medium: { min: 4, max: 12, clusters: 2, minClusterCells: 6, maxEmptyRowRun: 2, maxEmptyColRun: 2 },
     hard: { min: 0, max: 0, clusters: 0, minClusterCells: 0, maxEmptyRowRun: 0, maxEmptyColRun: 0 }
   };
-  const config = difficultyConfig[difficulty] || difficultyConfig.medium;
+  const baseConfig = progressionConfig?.blanks || difficultyConfig[difficulty] || difficultyConfig.medium;
+  const blankMin = Math.max(0, Math.floor(baseConfig.min));
+  const blankMax = Math.max(blankMin, Math.floor(baseConfig.max));
   const curveRatioByDifficulty = {
     easy: 0.32,
     medium: 0.28,
     hard: 0.24
   };
-  const curveRatio = curveRatioByDifficulty[difficulty] ?? 0.28;
-  const minTerminals = Math.max(6, Math.floor((ROWS * COLS) * 0.12));
-  const maxTerminals = Math.max(minTerminals + 2, Math.floor((ROWS * COLS) * 0.22));
-  const maxStraightRunAllowed = 4;
-  const minTerminalDistance = 2;
-  const maxTerminalClusterAllowed = 3;
+  const curveRatio = progressionConfig?.curveRatio ?? curveRatioByDifficulty[difficulty] ?? 0.28;
+  const minTerminalsDefault = Math.max(6, Math.floor((ROWS * COLS) * 0.12));
+  const maxTerminalsDefault = Math.max(minTerminalsDefault + 2, Math.floor((ROWS * COLS) * 0.22));
+  const minTerminals = progressionConfig?.minTerminals ?? minTerminalsDefault;
+  const maxTerminals = progressionConfig?.maxTerminals ?? maxTerminalsDefault;
+  const maxStraightRunAllowed = progressionConfig?.maxStraightRunAllowed ?? 4;
+  const minTerminalDistance = progressionConfig?.minTerminalDistance ?? 2;
+  const maxTerminalClusterAllowed = progressionConfig?.maxTerminalClusterAllowed ?? 3;
   let attemptSeed = 0;
   while (attemptSeed < 60) {
     rand = mulberry32(seed + attemptSeed * 97);
     edgesByCell = generateSolvedEdges(ROWS, COLS, rand);
-    if (config.max > 0) {
-      const targetCount = config.min + Math.floor(rand() * (config.max - config.min + 1));
+    if (blankMax > 0) {
+      const targetCount = blankMin + Math.floor(rand() * (blankMax - blankMin + 1));
       applySymmetricBlanks(
         edgesByCell,
         ROWS,
         COLS,
         rand,
         targetCount,
-        config.clusters,
-        config.minClusterCells,
-        config.maxEmptyRowRun,
-        config.maxEmptyColRun
+        baseConfig.clusters,
+        baseConfig.minClusterCells,
+        baseConfig.maxEmptyRowRun,
+        baseConfig.maxEmptyColRun,
+        baseConfig.centerBias ?? 0
       );
     }
     const terminals = countTerminals(edgesByCell, ROWS, COLS);
@@ -1221,6 +1456,421 @@ function TileSVG({ type, completeDirs }) {
   );
 }
 
+function Logo({ className = "", interactive = false, onClick, title, ariaLabel }) {
+  return (
+    <span className={`logo-text ${className}`.trim()}>
+      <span className="logo-word">ZENT</span>
+      {interactive ? (
+        <button
+          type="button"
+          className="title-cta logo-mark"
+          onClick={onClick}
+          aria-label={ariaLabel}
+          title={title}
+        >
+          ō
+        </button>
+      ) : (
+        <span className="logo-mark">ō</span>
+      )}
+    </span>
+  );
+}
+
+function ThemePanel({
+  themeMode,
+  themeIndex,
+  themes,
+  unlockedThemeLevels,
+  showThemePicker,
+  themePickerMounted,
+  onTogglePicker,
+  onSelectRandom,
+  onSelectTheme
+}) {
+  const activeTheme = themes[themeIndex] || themes[0];
+  const showActiveSwatch = themeMode !== "random" && activeTheme?.showSwatch !== false;
+  const coreThemes = themes
+    .map((theme, index) => ({ theme, index }))
+    .filter(({ theme }) => !theme.unlockable);
+  const unlockableThemes = themes
+    .map((theme, index) => ({ theme, index }))
+    .filter(({ theme }) => theme.unlockable);
+  return (
+    <div className="theme-panel theme-panel-card">
+      <p className="theme-title">Theme</p>
+      <div className="theme-summary">
+        <span className="theme-label">
+          {themeMode === "random" ? "Shuffle" : activeTheme?.name || "Theme"}
+        </span>
+        {themeMode === "random" ? (
+          <span className="theme-swatches">
+            <span className="theme-swatch theme-swatch-random" />
+          </span>
+        ) : showActiveSwatch ? (
+          <span className="theme-swatches">
+            {(activeTheme?.colors || themes[0].colors).slice(0, 1).map((color) => (
+              <span key={color} className="theme-swatch" style={{ background: color }} />
+            ))}
+          </span>
+        ) : null}
+      </div>
+      <button
+        type="button"
+        className="button button-ghost theme-toggle theme-toggle-full"
+        onClick={onTogglePicker}
+      >
+        {showThemePicker ? "Close" : "Change theme"}
+      </button>
+      {themePickerMounted ? (
+        <div className={`theme-accordion${showThemePicker ? " is-open" : ""}`}>
+          <div className="theme-group-title theme-group-title--basic">Basic themes</div>
+          <button
+            type="button"
+            className={`theme-button theme-button-wide is-full${
+              themeMode === "random" ? " is-active is-random" : ""
+            }`}
+            onClick={onSelectRandom}
+          >
+            <span className="theme-label">Shuffle</span>
+            <span className="theme-swatches">
+              <span className="theme-swatch theme-swatch-random" />
+            </span>
+          </button>
+          {coreThemes.map(({ theme, index }) => {
+            const isActive = themeMode === "fixed" && index === themeIndex;
+            const showSwatch = theme.showSwatch !== false;
+            return (
+              <button
+                key={theme.name}
+                type="button"
+                className={`theme-button theme-button-wide${
+                  isActive ? " is-active" : ""
+                }${theme.fullWidth ? " is-full" : ""}${
+                  theme.kind === "neumorphic" ? " is-neumorphic" : ""
+                }`}
+                onClick={() => onSelectTheme(index)}
+              >
+                <span className="theme-label">{theme.name}</span>
+                {showSwatch ? (
+                  <span className="theme-swatches">
+                    {theme.colors.slice(0, 1).map((color) => (
+                      <span key={color} className="theme-swatch" style={{ background: color }} />
+                    ))}
+                  </span>
+                ) : null}
+              </button>
+            );
+          })}
+          {unlockableThemes.length ? (
+            <div className="theme-group-header">
+              <div className="theme-group-title">Unlockable themes</div>
+            </div>
+          ) : null}
+          {unlockableThemes.map(({ theme, index }) => {
+            const isActive = themeMode === "fixed" && index === themeIndex;
+            const unlockLevel = Number(theme.unlockLevel);
+            const isUnlocked =
+              Number.isFinite(unlockLevel) && unlockedThemeLevels?.has(unlockLevel);
+            const isLocked = !isUnlocked;
+            return (
+              <button
+                key={theme.name}
+                type="button"
+                className={`theme-button theme-button-wide is-unlockable${
+                  isActive ? " is-active" : ""
+                }${theme.fullWidth ? " is-full" : ""}${
+                  isLocked ? " is-locked" : ""
+                }`}
+                onClick={() => {
+                  if (isLocked) return;
+                  onSelectTheme(index);
+                }}
+                disabled={isLocked}
+              >
+                <span className="theme-label">{theme.name}</span>
+                {isLocked ? (
+                  <span className="theme-lock">
+                    <span className="theme-lock-icon" aria-hidden="true">
+                      <svg viewBox="0 0 24 24" role="presentation">
+                        <path
+                          d="M7 11V8.5a5 5 0 0 1 10 0V11"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="1.8"
+                          strokeLinecap="round"
+                        />
+                        <rect
+                          x="5.5"
+                          y="11"
+                          width="13"
+                          height="9"
+                          rx="2.2"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="1.8"
+                        />
+                        <path
+                          d="M12 14.2v2.6"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="1.8"
+                          strokeLinecap="round"
+                        />
+                      </svg>
+                    </span>
+                    <span className="theme-lock-level">Lvl {theme.unlockLevel || "X"}</span>
+                  </span>
+                ) : null}
+              </button>
+            );
+          })}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function PlayerCard({
+  nowPlaying,
+  onPrev,
+  onNext,
+  onToggle,
+  isPaused,
+  isLoading,
+  audioAttribution,
+  isSubCard
+}) {
+  return (
+    <div className={`player-card${isSubCard ? " is-subcard" : ""}`}>
+      <div className="player-main">
+        <div className="player-info">
+          <p className="player-label">Now Playing</p>
+          <p className="player-title">{nowPlaying || "—"}</p>
+        </div>
+        <div className="player-controls">
+          <button type="button" className="player-button" onClick={onPrev} aria-label="Previous track">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M7 6v12M19 6l-8 6 8 6" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          </button>
+          <button
+            type="button"
+            className={`player-button player-button-main${isLoading ? " is-loading" : ""}`}
+            onClick={onToggle}
+            aria-label={isPaused ? "Play" : "Pause"}
+            aria-busy={isLoading}
+          >
+            {isPaused ? (
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M8 6l10 6-10 6z" fill="currentColor" />
+              </svg>
+            ) : (
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M8 6h3v12H8zM13 6h3v12h-3z" fill="currentColor" />
+              </svg>
+            )}
+          </button>
+          <button type="button" className="player-button" onClick={onNext} aria-label="Next track">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M17 6v12M5 6l8 6-8 6" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          </button>
+        </div>
+      </div>
+      <CreditsFooter audioAttribution={audioAttribution} />
+    </div>
+  );
+}
+
+function PerformanceCard({ performanceMode, onToggle }) {
+  return (
+    <div className="performance-card theme-panel-card">
+      <div className="perf-row">
+        <div className="perf-copy">
+          <p className="perf-label">Performance Mode</p>
+          <p className="perf-note">Turn this on if you're experiencing sluggish behavior.</p>
+        </div>
+        <button
+          type="button"
+          className={`button button-ghost perf-toggle${performanceMode ? " is-active" : ""}`}
+          onClick={onToggle}
+          aria-pressed={performanceMode}
+        >
+          {performanceMode ? "On" : "Off"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function InstallBanner({ onInstall, onDismiss }) {
+  return (
+    <div className="install-banner">
+      <div className="install-copy">
+        <p className="install-title">Install Zen Tile</p>
+        <p className="install-note">
+          Play offline and launch full-screen from your home screen.
+        </p>
+      </div>
+      <div className="install-actions">
+        <button type="button" className="button" onClick={onInstall}>
+          Install
+        </button>
+        <button type="button" className="button button-ghost" onClick={onDismiss}>
+          Not now
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function CreditsFooter({ audioAttribution }) {
+  return (
+    <div className="credits-footer">
+      {audioAttribution.map((item) => (
+        <span key={item.source}>
+          {item.source} — {item.license} (
+          <a className="modal-link" href={item.url} target="_blank" rel="noreferrer">
+            source
+          </a>
+          )
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function SoundsCard({
+  bgVolume,
+  fxVolume,
+  onToggleBg,
+  onToggleFx,
+  nowPlaying,
+  onPrev,
+  onNext,
+  onTogglePlay,
+  isPaused,
+  isLoading,
+  audioAttribution
+}) {
+  const bgLevel = bgVolume === 0 ? 0 : bgVolume <= 0.2 ? 1 : bgVolume <= 0.4 ? 2 : 3;
+  const fxLevel = fxVolume === 0 ? 0 : fxVolume <= 0.6 ? 1 : fxVolume <= 1.2 ? 2 : 3;
+  return (
+    <div className="sounds-card theme-panel-card">
+      <p className="theme-title">Sounds</p>
+      <div className="sounds-controls">
+        <button
+          type="button"
+          className={`sound-pill${fxVolume === 0 ? " is-muted" : ""}`}
+          onClick={onToggleFx}
+          aria-label="FX Volume"
+          title="FX Volume"
+        >
+          <span className="sound-pill-label">FX Volume</span>
+          <span className="sound-meter" aria-hidden="true">
+            {Array.from({ length: 3 }).map((_, idx) => (
+              <span key={idx} className={`sound-dot${idx < fxLevel ? " is-on" : ""}`} />
+            ))}
+          </span>
+        </button>
+        <button
+          type="button"
+          className={`sound-pill${bgVolume === 0 ? " is-muted" : ""}`}
+          onClick={onToggleBg}
+          aria-label="Music Volume"
+          title="Music Volume"
+        >
+          <span className="sound-pill-label">Music Volume</span>
+          <span className="sound-meter" aria-hidden="true">
+            {Array.from({ length: 3 }).map((_, idx) => (
+              <span key={idx} className={`sound-dot${idx < bgLevel ? " is-on" : ""}`} />
+            ))}
+          </span>
+        </button>
+      </div>
+      <PlayerCard
+        nowPlaying={nowPlaying}
+        onPrev={onPrev}
+        onNext={onNext}
+        onToggle={onTogglePlay}
+        isPaused={isPaused}
+        isLoading={isLoading}
+        audioAttribution={audioAttribution}
+        isSubCard
+      />
+    </div>
+  );
+}
+
+function ControlStack({
+  themeMode,
+  themeIndex,
+  themes,
+  unlockedThemeLevels,
+  showThemePicker,
+  themePickerMounted,
+  onTogglePicker,
+  onSelectRandom,
+  onSelectTheme,
+  bgVolume,
+  fxVolume,
+  onToggleBg,
+  onToggleFx,
+  nowPlaying,
+  onPrev,
+  onNext,
+  onTogglePlay,
+  isPaused,
+  isLoading,
+  performanceMode,
+  onTogglePerformance,
+  audioAttribution
+}) {
+  return (
+    <section className="floating-controls">
+      <p className="settings-title">Settings</p>
+      <ThemePanel
+        themeMode={themeMode}
+        themeIndex={themeIndex}
+        themes={themes}
+        unlockedThemeLevels={unlockedThemeLevels}
+        showThemePicker={showThemePicker}
+        themePickerMounted={themePickerMounted}
+        onTogglePicker={onTogglePicker}
+        onSelectRandom={onSelectRandom}
+        onSelectTheme={onSelectTheme}
+      />
+      <SoundsCard
+        bgVolume={bgVolume}
+        fxVolume={fxVolume}
+        onToggleBg={onToggleBg}
+        onToggleFx={onToggleFx}
+        nowPlaying={nowPlaying}
+        onPrev={onPrev}
+        onNext={onNext}
+        onTogglePlay={onTogglePlay}
+        isPaused={isPaused}
+        isLoading={isLoading}
+        audioAttribution={audioAttribution}
+      />
+      <PerformanceCard performanceMode={performanceMode} onToggle={onTogglePerformance} />
+      <div className="build-footer">
+        <span>Made by</span>
+        <span
+          className="build-footer-logo"
+          role="img"
+          aria-label="Lore & Order"
+          style={{
+            WebkitMaskImage: `url(${loreAndOrderLogo})`,
+            maskImage: `url(${loreAndOrderLogo})`
+          }}
+        />
+      </div>
+    </section>
+  );
+}
+
 export default function App() {
   const difficultyLevels = ["easy", "medium", "hard"];
   const themes = [
@@ -1265,8 +1915,84 @@ export default function App() {
       colors: ["#B0BEC5", "#90A4AE", "#78909C", "#607D8B", "#455A64"]
     },
     {
-      name: "Blue Mist",
-      colors: ["#C1C6C8", "#A7B2B5", "#8C9DAF", "#6B7B8A", "#4A5B6D"]
+      name: "Neumorphic",
+      kind: "neumorphic",
+      includeInRandom: false,
+      unlockable: true,
+      unlockLevel: 12,
+      fullWidth: true,
+      showSwatch: false,
+      colors: ["#EEF1F5", "#E6EBF1", "#E0E6EE", "#A3AFBC", "#6F7B86"]
+    },
+    {
+      name: "Ink Wash",
+      kind: "ink",
+      includeInRandom: false,
+      unlockable: true,
+      unlockLevel: 24,
+      fullWidth: true,
+      showSwatch: false,
+      colors: ["#F7F4EF", "#EDE7DE", "#DED6C9", "#2F2A24", "#6B5C52"]
+    },
+    {
+      name: "Paper Craft",
+      kind: "paper",
+      includeInRandom: false,
+      unlockable: true,
+      unlockLevel: 36,
+      fullWidth: true,
+      showSwatch: false,
+      colors: ["#F7F1E8", "#F1E7DA", "#E6D8C8", "#C26E4A", "#6C4E3E"]
+    },
+    {
+      name: "Brutalist Minimal",
+      kind: "brutalist",
+      includeInRandom: false,
+      unlockable: true,
+      unlockLevel: 48,
+      fullWidth: true,
+      showSwatch: false,
+      colors: ["#F6F4EF", "#FFFFFF", "#EDE7DE", "#111111", "#FF5A1F"]
+    },
+    {
+      name: "Glass & Glow",
+      kind: "glass",
+      includeInRandom: false,
+      unlockable: true,
+      unlockLevel: 60,
+      fullWidth: true,
+      showSwatch: false,
+      colors: ["#0B1324", "#101C33", "#182A4A", "#6AD5FF", "#A77BFF"]
+    },
+    {
+      name: "Blueprint Grid",
+      kind: "blueprint",
+      includeInRandom: false,
+      unlockable: true,
+      unlockLevel: 72,
+      fullWidth: true,
+      showSwatch: false,
+      colors: ["#081B33", "#0D2340", "#123055", "#5CC0FF", "#D5E8FF"]
+    },
+    {
+      name: "Synthwave",
+      kind: "synthwave",
+      includeInRandom: false,
+      unlockable: true,
+      unlockLevel: 84,
+      fullWidth: true,
+      showSwatch: false,
+      colors: ["#120526", "#2A0B5A", "#3E0F6E", "#FF5FDB", "#5ED1FF"]
+    },
+    {
+      name: "Retro CRT",
+      kind: "crt",
+      includeInRandom: false,
+      unlockable: true,
+      unlockLevel: 96,
+      fullWidth: true,
+      showSwatch: false,
+      colors: ["#07110D", "#0B1B14", "#0F2219", "#21FF8A", "#9BFFD0"]
     }
   ];
 
@@ -1302,20 +2028,119 @@ export default function App() {
   const [waveDelays, setWaveDelays] = useState(new Map());
   const [waveActive, setWaveActive] = useState(false);
   const [solvedDim, setSolvedDim] = useState(false);
-  const [fxVolume, setFxVolume] = useState(1);
-  const [bgVolume, setBgVolume] = useState(0.3);
+  const [fxVolume, setFxVolume] = useState(2.5);
+  const [bgVolume, setBgVolume] = useState(0.2);
   const [boardNoise] = useState(1);
   const [rotateSoundIndex, setRotateSoundIndex] = useState(4);
   const [completeSoundIndex, setCompleteSoundIndex] = useState(2);
   const [bgQueue, setBgQueue] = useState([]);
   const [bgQueuePos, setBgQueuePos] = useState(0);
   const [bgNowPlayingIndex, setBgNowPlayingIndex] = useState(0);
+  const [bgIsPaused, setBgIsPaused] = useState(true);
+  const [bgIsLoading, setBgIsLoading] = useState(false);
   const [showAttribution, setShowAttribution] = useState(false);
   const [showSuccess, setShowSuccess] = useState(false);
+  const [showFinalSuccess, setShowFinalSuccess] = useState(false);
+  const [successThemeApplied, setSuccessThemeApplied] = useState(false);
   const [successMessage, setSuccessMessage] = useState("Well done");
   const [performanceMode, setPerformanceMode] = useState(
     () => localStorage.getItem("zen_performance_mode") === "on"
   );
+  const [screen, setScreen] = useState("home");
+  const builderUnlocked = import.meta.env.DEV;
+  const [builderSettings, setBuilderSettings] = useState(() => {
+    try {
+      const raw = localStorage.getItem("zen_progression_settings");
+      if (!raw) return DEFAULT_PROGRESSION_SETTINGS;
+      const parsed = JSON.parse(raw);
+      return normalizeProgressionSettings(parsed);
+    } catch (err) {
+      return DEFAULT_PROGRESSION_SETTINGS;
+    }
+  });
+  const [builderTiles, setBuilderTiles] = useState(() =>
+    makeBoard(buildProgressionSeed(builderSettings), "medium")
+  );
+  const [builderLevel, setBuilderLevel] = useState("1");
+  const [builderViewLevel, setBuilderViewLevel] = useState(1);
+  const [builderCopyNotice, setBuilderCopyNotice] = useState(false);
+  const [saveNotice, setSaveNotice] = useState(false);
+  const [hasUnsavedLevels, setHasUnsavedLevels] = useState(() => {
+    try {
+      const raw = localStorage.getItem("zen_progression_levels_draft");
+      if (!raw) return false;
+      const normalized = normalizeLevelList(JSON.parse(raw));
+      return normalized.some((seed) => seed);
+    } catch (err) {
+      return false;
+    }
+  });
+  const [builderSeedDraft, setBuilderSeedDraft] = useState(() =>
+    buildProgressionSeed(builderSettings)
+  );
+  const [seedParseError, setSeedParseError] = useState("");
+  const [lastSavedAt, setLastSavedAt] = useState(() => {
+    const raw = localStorage.getItem("zen_progression_levels_saved_at");
+    const parsed = raw ? Number(raw) : NaN;
+    return Number.isFinite(parsed) ? parsed : null;
+  });
+  const [isBaking, setIsBaking] = useState(false);
+  const [progressionLevels, setProgressionLevels] = useState(() => {
+    const baked = normalizeLevelList(bakedProgressionLevels);
+    try {
+      const draftRaw = localStorage.getItem("zen_progression_levels_draft");
+      if (draftRaw) {
+        const parsed = JSON.parse(draftRaw);
+        const normalized = normalizeLevelList(parsed);
+        if (normalized.some((seed) => seed)) {
+          return normalized;
+        }
+      }
+    } catch (err) {
+      // Ignore draft parsing failures.
+    }
+    try {
+      const raw = localStorage.getItem("zen_progression_levels");
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        const normalized = normalizeLevelList(parsed);
+        if (normalized.some((seed) => seed)) {
+          return normalized;
+        }
+      }
+    } catch (err) {
+      // Ignore legacy parsing failures.
+    }
+    return baked;
+  });
+  const [progressCursor, setProgressCursor] = useState(0);
+  const endlessStateRef = useRef({
+    seedText: initialSeed,
+    tiles: initialTiles,
+    initialRotations: initialTiles.map((tile) => tile.rotation),
+    difficultyIndex: initialDifficultyIndex
+  });
+  const prevScreenRef = useRef(screen);
+  const [showLevelPicker, setShowLevelPicker] = useState(false);
+  const [progressCompletedLevels, setProgressCompletedLevels] = useState(() => {
+    try {
+      const raw = localStorage.getItem("zen_progress_completed");
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return [];
+      return parsed
+        .map((value) => Number(value))
+        .filter((value) => Number.isInteger(value) && value >= 1 && value <= TOTAL_LEVELS);
+    } catch (err) {
+      return [];
+    }
+  });
+  const [progressUnlockedLevel, setProgressUnlockedLevel] = useState(() => {
+    const raw = localStorage.getItem("zen_progress_unlocked");
+    const parsed = raw ? Number(raw) : NaN;
+    if (!Number.isFinite(parsed) || parsed < 1) return 1;
+    return Math.min(TOTAL_LEVELS, Math.floor(parsed));
+  });
   const initialRecentRandomThemes = useMemo(() => {
     try {
       const raw = localStorage.getItem("zen_recent_random_themes");
@@ -1328,23 +2153,100 @@ export default function App() {
   }, []);
   const recentRandomThemesRef = useRef(initialRecentRandomThemes);
   const successTimeoutRef = useRef(null);
+  const successThemePrevRef = useRef(null);
   const waveStartTimeoutRef = useRef(null);
   const waveEndTimeoutRef = useRef(null);
   const prevConnectionBitsRef = useRef(new Map());
   const prevCompleteBitsRef = useRef(new Map());
   const prevSolvedRef = useRef(false);
+  const progressShuffleThemeRef = useRef(false);
   const pulseEndRef = useRef(0);
+  const levelsInitRef = useRef(true);
+  const skipDraftRef = useRef(false);
+  const seedEditingRef = useRef(false);
   const audioCtxRef = useRef(null);
   const bgAudioRef = useRef(null);
   const bgUserPausedRef = useRef(false);
   const hasInteractedRef = useRef(false);
+  const [installPromptEvent, setInstallPromptEvent] = useState(null);
+  const [installDismissed, setInstallDismissed] = useState(
+    () => localStorage.getItem("zen_install_dismissed") === "yes"
+  );
+  const [isStandalone, setIsStandalone] = useState(false);
+  const {
+    needRefresh: [needRefresh, setNeedRefresh],
+    updateServiceWorker
+  } = useRegisterSW();
 
   useEffect(() => {
     localStorage.setItem("zen_theme_index", String(themeIndex));
   }, [themeIndex]);
 
   useEffect(() => {
+    if (installDismissed) {
+      localStorage.setItem("zen_install_dismissed", "yes");
+    } else {
+      localStorage.removeItem("zen_install_dismissed");
+    }
+  }, [installDismissed]);
+
+  useEffect(() => {
+    const media = window.matchMedia("(display-mode: standalone)");
+    const updateStandalone = () => {
+      const standalone = media.matches || window.navigator.standalone === true;
+      setIsStandalone(standalone);
+    };
+    updateStandalone();
+    if (media.addEventListener) {
+      media.addEventListener("change", updateStandalone);
+    } else if (media.addListener) {
+      media.addListener(updateStandalone);
+    }
+    return () => {
+      if (media.removeEventListener) {
+        media.removeEventListener("change", updateStandalone);
+      } else if (media.removeListener) {
+        media.removeListener(updateStandalone);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    const handleBeforeInstallPrompt = (event) => {
+      event.preventDefault();
+      setInstallPromptEvent(event);
+    };
+    const handleAppInstalled = () => {
+      setInstallPromptEvent(null);
+      setInstallDismissed(true);
+    };
+    window.addEventListener("beforeinstallprompt", handleBeforeInstallPrompt);
+    window.addEventListener("appinstalled", handleAppInstalled);
+    return () => {
+      window.removeEventListener("beforeinstallprompt", handleBeforeInstallPrompt);
+      window.removeEventListener("appinstalled", handleAppInstalled);
+    };
+  }, []);
+
+  useEffect(() => {
     const theme = themes[themeIndex] || themes[0];
+    const root = document.documentElement;
+    if (theme?.kind) {
+      root.setAttribute("data-theme", theme.kind);
+      [
+        "--bg-start",
+        "--bg-mid",
+        "--bg-end",
+        "--accent",
+        "--loop",
+        "--loop-soft",
+        "--ink",
+        "--muted",
+        "--board-bg"
+      ].forEach((prop) => root.style.removeProperty(prop));
+      return;
+    }
+    root.removeAttribute("data-theme");
     const [c1, c2, c3, c4, c5] = theme.colors;
     const toRgba = (hex, alpha) => {
       const normalized = hex.replace("#", "");
@@ -1372,7 +2274,6 @@ export default function App() {
       const b = Math.round(parseInt(normalized.slice(4, 6), 16) * factor);
       return `rgb(${r}, ${g}, ${b})`;
     };
-    const root = document.documentElement;
     root.style.setProperty("--bg-start", c1);
     root.style.setProperty("--bg-mid", c2);
     root.style.setProperty("--bg-end", c3);
@@ -1433,18 +2334,30 @@ export default function App() {
     localStorage.setItem("zen_theme_mode", themeMode);
   }, [themeMode]);
 
+  useEffect(() => {
+    localStorage.setItem("zen_progression_settings", JSON.stringify(builderSettings));
+  }, [builderSettings]);
+
+  useEffect(() => {
+    localStorage.setItem("zen_progress_completed", JSON.stringify(progressCompletedLevels));
+  }, [progressCompletedLevels]);
+
+  useEffect(() => {
+    localStorage.setItem("zen_progress_unlocked", String(progressUnlockedLevel));
+  }, [progressUnlockedLevel]);
+
   const getNextRandomTheme = () => {
-    const total = themes.length;
-    if (total === 0) return 0;
+    const eligible = themes
+      .map((theme, index) => (theme.includeInRandom === false ? null : index))
+      .filter((value) => value !== null);
+    if (eligible.length === 0) return 0;
+    const eligibleSet = new Set(eligible);
     const recent = recentRandomThemesRef.current
-      .filter((index) => index >= 0 && index < total)
+      .filter((index) => eligibleSet.has(index))
       .slice(0, 2);
     const recentSet = new Set(recent);
-    const candidates = [];
-    for (let i = 0; i < total; i += 1) {
-      if (!recentSet.has(i)) candidates.push(i);
-    }
-    const pool = candidates.length > 0 ? candidates : Array.from({ length: total }, (_, i) => i);
+    const candidates = eligible.filter((index) => !recentSet.has(index));
+    const pool = candidates.length > 0 ? candidates : eligible;
     const next = pool[Math.floor(Math.random() * pool.length)];
     recentRandomThemesRef.current = [next, ...recent].slice(0, 2);
     localStorage.setItem("zen_recent_random_themes", JSON.stringify(recentRandomThemesRef.current));
@@ -1455,6 +2368,13 @@ export default function App() {
     recentRandomThemesRef.current = [];
     localStorage.removeItem("zen_recent_random_themes");
   };
+
+  useEffect(() => {
+    if (themeMode === "random") {
+      const nextTheme = getNextRandomTheme();
+      setThemeIndex(nextTheme);
+    }
+  }, [themeMode]);
 
   useEffect(() => {
     localStorage.setItem("zen_difficulty", difficultyLevels[difficultyIndex]);
@@ -1509,6 +2429,34 @@ export default function App() {
     return audioCtxRef.current;
   }
 
+  const syncBgPaused = (nextValue) => {
+    if (typeof nextValue === "boolean") {
+      setBgIsPaused(nextValue);
+      return;
+    }
+    setBgIsPaused(bgAudioRef.current?.paused ?? true);
+  };
+
+  const attemptBgPlay = (audio) => {
+    if (!audio) return;
+    setBgIsLoading(true);
+    const playPromise = audio.play();
+    if (playPromise && typeof playPromise.then === "function") {
+      playPromise
+        .then(() => {
+          setBgIsLoading(false);
+          syncBgPaused(false);
+        })
+        .catch(() => {
+          setBgIsLoading(false);
+          syncBgPaused(true);
+        });
+    } else {
+      setBgIsLoading(false);
+      syncBgPaused(audio.paused);
+    }
+  };
+
   function ensureAudioReady() {
     const ctx = ensureAudioContext();
     if (bgVolume > 0) {
@@ -1518,7 +2466,7 @@ export default function App() {
       if (!bgAudioRef.current) {
         startAmbient();
       } else if (bgAudioRef.current.paused) {
-        bgAudioRef.current.play().catch(() => {});
+        attemptBgPlay(bgAudioRef.current);
       }
     }
     return ctx;
@@ -1746,17 +2694,36 @@ export default function App() {
     const audio = new Audio(trackUrl);
     audio.loop = false;
     audio.volume = Math.min(1.0, bgVolume * 0.4);
-
-    audio.onended = () => playNextBg();
-    audio.play().catch(() => {});
+    audio.onplay = () => {
+      setBgIsLoading(false);
+      syncBgPaused(false);
+    };
+    audio.onpause = () => {
+      setBgIsLoading(false);
+      syncBgPaused(true);
+    };
+    audio.onended = () => {
+      setBgIsLoading(false);
+      syncBgPaused(true);
+      playNextBg();
+    };
     bgAudioRef.current = audio;
+    syncBgPaused(true);
+    setBgIsLoading(true);
+    attemptBgPlay(audio);
   }
 
   function stopAmbient() {
-    if (!bgAudioRef.current) return;
+    if (!bgAudioRef.current) {
+      syncBgPaused(true);
+      setBgIsLoading(false);
+      return;
+    }
     bgAudioRef.current.pause();
     bgAudioRef.current.currentTime = 0;
     bgAudioRef.current = null;
+    syncBgPaused(true);
+    setBgIsLoading(false);
   }
 
   function playNextBg() {
@@ -1809,69 +2776,6 @@ export default function App() {
     });
   }, [tiles, completeDirs]);
 
-  useEffect(() => {
-    if (solved && !prevSolvedRef.current) {
-      const step = 180;
-      const groupSize = 2;
-      const delays = new Map();
-      let maxDelay = 0;
-      tiles.forEach((tile) => {
-        const groupIndex = Math.floor(tile.r / groupSize);
-        const delay = groupIndex * step;
-        delays.set(tile.id, delay);
-        if (delay > maxDelay) maxDelay = delay;
-      });
-
-      const startWave = () => {
-        setWaveDelays(delays);
-        setWaveActive(true);
-        setSolvedDim(false);
-        playWaveMelodyAscending();
-        const total = maxDelay + 700;
-        waveEndTimeoutRef.current = window.setTimeout(() => {
-          setWaveActive(false);
-          setSolvedDim(true);
-          waveEndTimeoutRef.current = null;
-        }, total);
-      };
-
-      const waveDelay = 400;
-      const remaining = Math.max(0, pulseEndRef.current - performance.now());
-      const totalDelay = remaining + waveDelay;
-      if (totalDelay > 0) {
-        waveStartTimeoutRef.current = window.setTimeout(() => {
-          startWave();
-          waveStartTimeoutRef.current = null;
-        }, totalDelay);
-      } else {
-        startWave();
-      }
-      const successDelay = totalDelay + 1600;
-      if (successTimeoutRef.current) {
-        window.clearTimeout(successTimeoutRef.current);
-      }
-      successTimeoutRef.current = window.setTimeout(() => {
-        const messages = [
-          "Nicely done",
-          "Well done",
-          "Nice work",
-          "Good work",
-          "Level complete",
-          "Puzzle complete",
-          "Level solved",
-          "Puzzle solved",
-          "Task complete"
-        ];
-        setSuccessMessage(messages[Math.floor(Math.random() * messages.length)]);
-        setShowSuccess(true);
-      }, successDelay);
-    }
-    if (!solved && prevSolvedRef.current) {
-      cancelFinalAnimations();
-    }
-    prevSolvedRef.current = solved;
-  }, [solved, tiles]);
-
   function regenerate(nextSeed, nextDifficulty = difficultyLevels[difficultyIndex], { shuffleTheme = false } = {}) {
     if (shuffleTheme && themeMode === "random") {
       const nextTheme = getNextRandomTheme();
@@ -1887,6 +2791,266 @@ export default function App() {
     setSeedText(nextSeed);
     regenerate(nextSeed);
   }
+
+  const updateBuilderSetting = (key, value) => {
+    setBuilderSettings((prev) =>
+      normalizeProgressionSettings({
+        ...prev,
+        [key]: value
+      })
+    );
+  };
+
+  const applyBuilderSeedDraft = () => {
+    const cleaned = builderSeedDraft.trim();
+    const parsed = parseProgressionSeed(cleaned);
+    if (!parsed) {
+      setSeedParseError("Invalid seed");
+      return false;
+    }
+    setSeedParseError("");
+    setBuilderSettings(parsed);
+    return true;
+  };
+
+  const setGapRateFromGapCells = (value) => {
+    const total = ROWS * COLS;
+    const raw = Number(value);
+    if (!Number.isFinite(raw)) return;
+    const maxBlankCells = Math.max(0, total - MIN_TILES);
+    const clamped = clampValue(Math.round(raw), 0, maxBlankCells);
+    const snapped = Math.round(clamped / 4) * 4;
+    const rate = Math.round((snapped / total) * 100);
+    updateBuilderSetting("gapRate", rate);
+  };
+
+  const setGapRateFromTileCount = (value) => {
+    const total = ROWS * COLS;
+    const raw = Number(value);
+    if (!Number.isFinite(raw)) return;
+    const clamped = clampValue(Math.round(raw), MIN_TILES, total);
+    const gapCells = total - clamped;
+    setGapRateFromGapCells(gapCells);
+  };
+
+  const rollBuilderVariant = () => {
+    const min = PROGRESSION_SETTINGS_RANGES.variant.min;
+    const max = PROGRESSION_SETTINGS_RANGES.variant.max;
+    const next = Math.floor(Math.random() * (max - min + 1)) + min;
+    updateBuilderSetting("variant", next);
+  };
+
+  const handleCopyBuilderSeed = async () => {
+    if (!navigator.clipboard) return;
+    try {
+      await navigator.clipboard.writeText(builderSeed);
+      setBuilderCopyNotice(true);
+      window.setTimeout(() => setBuilderCopyNotice(false), 1400);
+    } catch (err) {
+      setBuilderCopyNotice(false);
+    }
+  };
+
+  const handleAssignLevel = () => {
+    if (!levelIsValid) return;
+    const nextLevels = [...progressionLevels];
+    nextLevels[levelNumber - 1] = builderSeed;
+    skipDraftRef.current = true;
+    setProgressionLevels(nextLevels);
+    setBuilderViewLevel(levelNumber);
+    if (levelNumber < TOTAL_LEVELS) {
+      setBuilderLevel(String(levelNumber + 1));
+    }
+    handleSaveLevels(nextLevels);
+  };
+
+  const handleClearLevel = (level) => {
+    if (!Number.isInteger(level) || level < 1 || level > TOTAL_LEVELS) return;
+    setProgressionLevels((prev) => {
+      const next = [...prev];
+      next[level - 1] = "";
+      return next;
+    });
+  };
+
+  const downloadTextFile = (filename, text, type) => {
+    const blob = new Blob([text], { type });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleExportLevelsJSON = () => {
+    const payload = {
+      version: 1,
+      levels: progressionLevels.map((seed, index) => ({
+        level: index + 1,
+        seed: seed || ""
+      }))
+    };
+    downloadTextFile("progression-levels.json", JSON.stringify(payload, null, 2), "application/json");
+  };
+
+  const handleExportLevelsCSV = () => {
+    const escapeCell = (value) => {
+      const text = String(value ?? "");
+      if (text.includes(",") || text.includes("\"") || text.includes("\n")) {
+        return `"${text.replace(/\"/g, "\"\"")}"`;
+      }
+      return text;
+    };
+    const header = "level,seed";
+    const rows = progressionLevels.map((seed, index) =>
+      `${escapeCell(index + 1)},${escapeCell(seed || "")}`
+    );
+    downloadTextFile("progression-levels.csv", [header, ...rows].join("\n"), "text/csv");
+  };
+
+  const handleSaveLevels = async (levelsOverride) => {
+    const levelsToSave = Array.isArray(levelsOverride) ? levelsOverride : progressionLevels;
+    setIsBaking(true);
+    try {
+      localStorage.setItem("zen_progression_levels", JSON.stringify(levelsToSave));
+      localStorage.removeItem("zen_progression_levels_draft");
+    } catch (err) {
+      // Ignore persistence errors.
+    }
+    let bakedOk = true;
+    if (import.meta.env.DEV) {
+      const url = `${import.meta.env.BASE_URL}__bake-levels`;
+      try {
+        const response = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ levels: levelsToSave })
+        });
+        if (!response.ok) bakedOk = false;
+      } catch (err) {
+        bakedOk = false;
+      }
+    }
+    setIsBaking(false);
+    if (bakedOk) {
+      setHasUnsavedLevels(false);
+      const now = Date.now();
+      setLastSavedAt(now);
+      try {
+        localStorage.setItem("zen_progression_levels_saved_at", String(now));
+      } catch (err) {
+        // Ignore timestamp persistence errors.
+      }
+      setSaveNotice(true);
+      window.setTimeout(() => setSaveNotice(false), 1400);
+    } else {
+      setHasUnsavedLevels(true);
+    }
+  };
+
+  const handleLoadLevelSeed = (seed, level) => {
+    const parsed = parseProgressionSeed(seed);
+    if (!parsed) return;
+    setBuilderSettings(parsed);
+    if (Number.isInteger(level)) {
+      setBuilderViewLevel(level);
+      const nextTarget = Math.min(TOTAL_LEVELS, level + 1);
+      setBuilderLevel(String(nextTarget));
+    }
+  };
+
+  const handleResetProgression = () => {
+    setProgressCompletedLevels([]);
+    setProgressUnlockedLevel(1);
+    setShowFinalSuccess(false);
+    setShowSuccess(false);
+    setShowLevelPicker(true);
+    const firstIndex = assignedLevelIndexByNumber.get(1) ?? 0;
+    setProgressCursor(firstIndex);
+    if (isProgress && assignedLevels[firstIndex]) {
+      const nextSeed = assignedLevels[firstIndex].seed;
+      setSeedText(nextSeed);
+      regenerate(nextSeed, difficultyLevels[difficultyIndex], { shuffleTheme: false });
+    }
+  };
+
+  const navigateBuilderLevel = (direction) => {
+    const base = clampValue(builderLevelDisplay, 1, TOTAL_LEVELS);
+    const nextLevel = clampValue(base + direction, 1, TOTAL_LEVELS);
+    setBuilderViewLevel(nextLevel);
+    const seed = progressionLevels[nextLevel - 1];
+    if (seed) {
+      handleLoadLevelSeed(seed, nextLevel);
+    } else {
+      const nextTarget = Math.min(TOTAL_LEVELS, nextLevel + 1);
+      setBuilderLevel(String(nextTarget));
+    }
+  };
+
+  const markProgressLevelComplete = (level) => {
+    if (!Number.isInteger(level) || level < 1 || level > TOTAL_LEVELS) return;
+    setProgressCompletedLevels((prev) => {
+      if (prev.includes(level)) return prev;
+      const next = [...prev, level];
+      next.sort((a, b) => a - b);
+      return next;
+    });
+    setProgressUnlockedLevel((prev) => Math.max(prev, Math.min(TOTAL_LEVELS, level + 1)));
+  };
+
+  const handleSelectProgressLevel = (level) => {
+    const index = assignedLevelIndexByNumber.get(level);
+    if (index === undefined) return;
+    progressShuffleThemeRef.current = themeMode === "random";
+    setProgressCursor(index);
+    setShowLevelPicker(false);
+    setShowSuccess(false);
+  };
+
+  const handleApplyUnlockedTheme = (index) => {
+    const theme = themes[index];
+    if (!theme) return;
+    if (!successThemeApplied) {
+      successThemePrevRef.current = { mode: themeMode, index: themeIndex };
+      setThemeMode("fixed");
+      setThemeIndex(index);
+      clearRecentRandomThemes();
+      setShowThemePicker(false);
+      setSuccessThemeApplied(true);
+      return;
+    }
+    const prev = successThemePrevRef.current;
+    if (prev) {
+      setThemeMode(prev.mode);
+      setThemeIndex(prev.index);
+    }
+    setSuccessThemeApplied(false);
+  };
+
+  const toggleLevelPicker = () => {
+    setShowLevelPicker((prev) => {
+      const next = !prev;
+      if (next) {
+        cancelFinalAnimations();
+      }
+      return next;
+    });
+  };
+
+  const rotateBuilderTile = (index) => {
+    setBuilderTiles((prev) => {
+      const next = [...prev];
+      const tile = { ...next[index] };
+      const prevRotationDegrees = tile.rotationDegrees ?? tile.rotation * 90;
+      tile.rotation = (tile.rotation + 1) % 4;
+      tile.rotationDegrees = prevRotationDegrees + 90;
+      next[index] = tile;
+      return next;
+    });
+  };
 
   function rotateTile(index) {
     hasInteractedRef.current = true;
@@ -1999,6 +3163,7 @@ export default function App() {
     setWaveDelays(new Map());
     setSolvedDim(false);
     setShowSuccess(false);
+    setShowFinalSuccess(false);
     if (successTimeoutRef.current) {
       window.clearTimeout(successTimeoutRef.current);
       successTimeoutRef.current = null;
@@ -2013,424 +3178,1631 @@ export default function App() {
     }
   };
 
+  useEffect(() => {
+    cancelFinalAnimations();
+  }, [screen]);
+
   const confettiCount = performanceMode ? 40 : 120;
+  const isHome = screen === "home";
+  const isProgression = screen === "progression";
+  const isProgress = screen === "progress";
+  const isEndless = screen === "endless";
+  const builderSeed = useMemo(() => buildProgressionSeed(builderSettings), [builderSettings]);
+  const builderConfig = useMemo(
+    () => progressionSettingsToBoardConfig(builderSettings),
+    [builderSettings]
+  );
+  const builderConnections = useMemo(
+    () => computeConnections(builderTiles),
+    [builderTiles]
+  );
+  const builderCompleteDirs = useMemo(
+    () => computeCompleteDirs(builderTiles, builderConnections),
+    [builderTiles, builderConnections]
+  );
+  const themeUnlockMap = useMemo(() => {
+    const map = new Map();
+    themes.forEach((theme, index) => {
+      if (!theme.unlockable) return;
+      const unlockLevel = Number(theme.unlockLevel);
+      if (Number.isFinite(unlockLevel)) {
+        map.set(unlockLevel, { theme, index, unlockLevel });
+      }
+    });
+    return map;
+  }, [themes]);
+  const levelEntries = useMemo(
+    () => progressionLevels.map((seed, index) => ({ level: index + 1, seed })),
+    [progressionLevels]
+  );
+  const assignedLevels = useMemo(
+    () => levelEntries.filter((entry) => Boolean(entry.seed)),
+    [levelEntries]
+  );
+  const assignedLevelIndexByNumber = useMemo(() => {
+    const map = new Map();
+    assignedLevels.forEach((level, index) => {
+      map.set(level.level, index);
+    });
+    return map;
+  }, [assignedLevels]);
+  const progressCompletedSet = useMemo(
+    () => new Set(progressCompletedLevels),
+    [progressCompletedLevels]
+  );
+  const assignedCount = assignedLevels.length;
+  const totalCells = ROWS * COLS;
+  const maxBlankCells = Math.max(0, totalCells - MIN_TILES);
+  const effectiveGapRate = totalCells
+    ? Math.round((builderConfig.blanks.min / totalCells) * 100)
+    : 0;
+  const builderTileCount = Math.max(0, totalCells - builderConfig.blanks.min);
+  const levelNumber = Number(builderLevel);
+  const levelIsValid =
+    Number.isInteger(levelNumber) && levelNumber >= 1 && levelNumber <= TOTAL_LEVELS;
+  const assignedSeedForLevel = levelIsValid ? progressionLevels[levelNumber - 1] : "";
+  const builderLevelDisplay = clampValue(
+    Number.isFinite(builderViewLevel) ? builderViewLevel : 1,
+    1,
+    TOTAL_LEVELS
+  );
+  const builderLevelSeed = progressionLevels[builderLevelDisplay - 1] || "";
+  const builderLevelHasSeed = Boolean(builderLevelSeed.trim());
+  const lastSavedLabel = useMemo(() => {
+    if (!lastSavedAt) return "";
+    try {
+      return new Date(lastSavedAt).toLocaleString(undefined, {
+        month: "short",
+        day: "numeric",
+        hour: "numeric",
+        minute: "2-digit"
+      });
+    } catch (err) {
+      return "";
+    }
+  }, [lastSavedAt]);
+  const progressLevelsAvailable = assignedLevels.length > 0;
+  const progressLevel = progressLevelsAvailable ? assignedLevels[progressCursor] : null;
+  const progressLevelNumber = progressLevel?.level ?? null;
+  const progressSeed = progressLevel?.seed ?? "";
+  const nextProgressLevel = assignedLevels[progressCursor + 1] ?? null;
+  const hasNextProgressLevel = Boolean(
+    nextProgressLevel && nextProgressLevel.level <= progressUnlockedLevel
+  );
+  const isProgressPlayable = isProgress && progressLevelsAvailable;
+  const isBoardScreen = isEndless || isProgressPlayable;
+  const isFinalLevel = isProgress && progressLevelNumber === TOTAL_LEVELS;
+  const isProgressionComplete = progressCompletedSet.has(TOTAL_LEVELS);
+  const unlockableThemeForLevel = useMemo(() => {
+    if (!Number.isInteger(progressLevelNumber)) return null;
+    return themeUnlockMap.get(progressLevelNumber) || null;
+  }, [progressLevelNumber, themeUnlockMap]);
+  const progressSuccessTitle = progressLevelNumber ? `Level ${progressLevelNumber} complete` : "Level complete";
+  const finalSuccessTitle = "A Winner Is You";
+  const successTitle = showFinalSuccess
+    ? finalSuccessTitle
+    : isProgress
+      ? progressSuccessTitle
+      : successMessage;
+
+  useEffect(() => {
+    if (!progressLevelsAvailable) {
+      setProgressCursor(0);
+      return;
+    }
+    setProgressCursor((prev) => Math.min(prev, assignedLevels.length - 1));
+  }, [progressLevelsAvailable, assignedLevels.length]);
+
+  useEffect(() => {
+    if (!progressCompletedLevels.length) {
+      setProgressUnlockedLevel(1);
+      return;
+    }
+    const maxCompleted = Math.max(...progressCompletedLevels);
+    const minUnlocked = Math.min(TOTAL_LEVELS, Math.max(1, maxCompleted + 1));
+    setProgressUnlockedLevel((prev) => Math.max(prev, minUnlocked));
+  }, [progressCompletedLevels]);
+
+  useEffect(() => {
+    if (!isProgress) {
+      setShowLevelPicker(false);
+    }
+  }, [isProgress]);
+
+  useEffect(() => {
+    if (import.meta.env.DEV) return;
+    if (screen === "progression") {
+      setScreen("home");
+    }
+  }, [screen]);
+
+  useEffect(() => {
+    if (!showSuccess) {
+      setSuccessThemeApplied(false);
+      successThemePrevRef.current = null;
+      return;
+    }
+    setSuccessThemeApplied(false);
+    successThemePrevRef.current = null;
+  }, [showSuccess, unlockableThemeForLevel?.index]);
+
+  useEffect(() => {
+    if (!isProgress) return;
+    if (!progressLevelsAvailable) return;
+    const level = assignedLevels[progressCursor];
+    if (!level) return;
+    const shouldShuffleTheme = progressShuffleThemeRef.current;
+    progressShuffleThemeRef.current = false;
+    setSeedText(level.seed);
+    regenerate(level.seed, difficultyLevels[difficultyIndex], { shuffleTheme: shouldShuffleTheme });
+  }, [isProgress, progressLevelsAvailable, assignedLevels, progressCursor, difficultyIndex]);
+
+  useEffect(() => {
+    const prev = prevScreenRef.current;
+    if (prev === "endless" && screen !== "endless") {
+      endlessStateRef.current = {
+        seedText,
+        tiles,
+        initialRotations,
+        difficultyIndex
+      };
+    }
+    if (prev !== "progress" && screen === "progress") {
+      if (assignedLevels.length > 0) {
+        let targetIndex = -1;
+        for (let i = assignedLevels.length - 1; i >= 0; i -= 1) {
+          if (assignedLevels[i].level <= progressUnlockedLevel) {
+            targetIndex = i;
+            break;
+          }
+        }
+        if (targetIndex === -1) {
+          targetIndex = 0;
+        }
+        setProgressCursor(targetIndex);
+      }
+    }
+    if (prev !== "endless" && screen === "endless") {
+      const saved = endlessStateRef.current;
+      if (saved) {
+        setSeedText(saved.seedText);
+        setTiles(saved.tiles);
+        setInitialRotations(saved.initialRotations);
+        setDifficultyIndex(saved.difficultyIndex);
+      }
+    }
+    prevScreenRef.current = screen;
+  }, [screen]);
+
+  useEffect(() => {
+    if (!isBoardScreen) {
+      prevSolvedRef.current = solved;
+      return;
+    }
+    if (solved && !prevSolvedRef.current) {
+      const step = 180;
+      const groupSize = 2;
+      const delays = new Map();
+      let maxDelay = 0;
+      tiles.forEach((tile) => {
+        const groupIndex = Math.floor(tile.r / groupSize);
+        const delay = groupIndex * step;
+        delays.set(tile.id, delay);
+        if (delay > maxDelay) maxDelay = delay;
+      });
+
+      const startWave = () => {
+        setWaveDelays(delays);
+        setWaveActive(true);
+        setSolvedDim(false);
+        playWaveMelodyAscending();
+        const total = maxDelay + 700;
+        waveEndTimeoutRef.current = window.setTimeout(() => {
+          setWaveActive(false);
+          setSolvedDim(true);
+          waveEndTimeoutRef.current = null;
+        }, total);
+      };
+
+      const waveDelay = 400;
+      const remaining = Math.max(0, pulseEndRef.current - performance.now());
+      const totalDelay = remaining + waveDelay;
+      if (totalDelay > 0) {
+        waveStartTimeoutRef.current = window.setTimeout(() => {
+          startWave();
+          waveStartTimeoutRef.current = null;
+        }, totalDelay);
+      } else {
+        startWave();
+      }
+      const successDelay = totalDelay + 1600;
+      if (successTimeoutRef.current) {
+        window.clearTimeout(successTimeoutRef.current);
+      }
+      successTimeoutRef.current = window.setTimeout(() => {
+        const messages = [
+          "Nicely done",
+          "Well done",
+          "Nice work",
+          "Good work",
+          "Level complete",
+          "Puzzle complete",
+          "Level solved",
+          "Puzzle solved",
+          "Task complete"
+        ];
+        const nextMessage = isProgress
+          ? progressSuccessTitle
+          : messages[Math.floor(Math.random() * messages.length)];
+        if (isProgress && Number.isInteger(progressLevelNumber)) {
+          markProgressLevelComplete(progressLevelNumber);
+        }
+        const isFinal = isFinalLevel;
+        setShowFinalSuccess(isFinal);
+        setSuccessMessage(nextMessage);
+        setShowSuccess(true);
+      }, successDelay);
+    }
+    if (!solved && prevSolvedRef.current) {
+      cancelFinalAnimations();
+    }
+    prevSolvedRef.current = solved;
+  }, [solved, tiles, isBoardScreen, isProgress, progressSuccessTitle, progressLevelNumber, isFinalLevel]);
+
+  useEffect(() => {
+    setBuilderTiles(makeBoard(builderSeed, "medium"));
+  }, [builderSeed]);
+
+  useEffect(() => {
+    if (seedEditingRef.current) return;
+    setBuilderSeedDraft(builderSeed);
+    setSeedParseError("");
+  }, [builderSeed]);
+
+  useEffect(() => {
+    const theme = themes[themeIndex];
+    if (themeMode !== "fixed" || !theme?.unlockable) return;
+    const unlockLevel = Number(theme.unlockLevel);
+    if (!Number.isFinite(unlockLevel)) return;
+    if (!progressCompletedSet.has(unlockLevel)) {
+      setThemeMode("fixed");
+      setThemeIndex(0);
+    }
+  }, [themes, themeIndex, themeMode, progressCompletedSet]);
+
+  useEffect(() => {
+    if (levelsInitRef.current) {
+      levelsInitRef.current = false;
+      return;
+    }
+    if (skipDraftRef.current) {
+      skipDraftRef.current = false;
+      return;
+    }
+    setHasUnsavedLevels(true);
+    try {
+      localStorage.setItem("zen_progression_levels_draft", JSON.stringify(progressionLevels));
+    } catch (err) {
+      // Ignore draft persistence errors.
+    }
+  }, [progressionLevels]);
+  const toggleThemePicker = () => {
+    if (showThemePicker) {
+      setShowThemePicker(false);
+      window.setTimeout(() => setThemePickerMounted(false), 260);
+    } else {
+      setThemePickerMounted(true);
+      window.requestAnimationFrame(() => setShowThemePicker(true));
+    }
+  };
+  const selectRandomTheme = () => {
+    setThemeMode("random");
+    setShowThemePicker(false);
+    window.setTimeout(() => setThemePickerMounted(false), 260);
+  };
+  const selectFixedTheme = (index) => {
+    const theme = themes[index];
+    if (theme?.unlockable) {
+      const unlockLevel = Number(theme.unlockLevel);
+      if (!Number.isFinite(unlockLevel) || !progressCompletedSet.has(unlockLevel)) {
+        return;
+      }
+    }
+    setThemeMode("fixed");
+    setThemeIndex(index);
+    clearRecentRandomThemes();
+    setShowThemePicker(false);
+    window.setTimeout(() => setThemePickerMounted(false), 260);
+  };
+  const toggleBgPlay = () => {
+    if (!bgAudioRef.current) {
+      bgUserPausedRef.current = false;
+      if (bgVolume === 0) {
+        setBgVolume(0.2);
+        return;
+      }
+      startAmbient();
+      return;
+    }
+    if (bgAudioRef.current.paused) {
+      bgUserPausedRef.current = false;
+      attemptBgPlay(bgAudioRef.current);
+    } else {
+      bgUserPausedRef.current = true;
+      bgAudioRef.current.pause();
+      syncBgPaused(true);
+      setBgIsLoading(false);
+    }
+  };
+  const isBgPaused = bgIsPaused;
+  const isBgLoading = bgIsLoading;
+  const showInstallBanner = Boolean(installPromptEvent) && !installDismissed && !isStandalone && isHome;
+  const handleInstallClick = async () => {
+    if (!installPromptEvent) return;
+    installPromptEvent.prompt();
+    try {
+      await installPromptEvent.userChoice;
+    } catch (err) {
+      // Ignore prompt errors; we just hide the banner for now.
+    }
+    setInstallPromptEvent(null);
+    setInstallDismissed(true);
+  };
+  const handleInstallDismiss = () => {
+    setInstallDismissed(true);
+  };
+  const handleUpdateNow = () => {
+    setNeedRefresh(false);
+    updateServiceWorker(true);
+  };
+  const handleUpdateLater = () => {
+    setNeedRefresh(false);
+  };
 
   return (
     <div
       className={`app${solvedDim ? " is-solved" : ""}${showSuccess ? " show-success" : ""}${
         performanceMode ? " is-perf" : ""
-      }`}
+      }${isHome ? " is-home" : ""}`}
     >
-      <header className="top-controls">
-        <h1 className="app-title">
-          ZENT
-          <button
-            type="button"
-            className="title-cta"
-            onClick={solveAllButOne}
-            aria-label="Solve all but one tile"
-            title="Solve all but one tile"
-          >
-            ō
-          </button>
-        </h1>
-        <div className="header-controls">
-          <div className="header-actions">
-            <button
-              type="button"
-              className={`button${resetSpinning ? " reset-spin" : ""}`}
-              onClick={() => {
-                if (resetDisabled) return;
-                setResetSpinning(true);
-                window.setTimeout(() => setResetSpinning(false), 420);
-                regenerate(seedText, difficultyLevels[difficultyIndex], { shuffleTheme: false });
-              }}
-              aria-label="Reset level"
-              title="Reset"
-              disabled={resetDisabled}
-            >
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path
-                  d="M17 7a7 7 0 1 0 1.9 6.3"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2.6"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                />
-                <path
-                  d="M19 4.5v4.8h-4.8"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2.6"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                />
-              </svg>
-            </button>
-            <button
-              type="button"
-              className="button button-ghost"
-              onClick={() => {
-                const nextSeed = Math.random().toString(36).slice(2, 8);
-                setSeedText(nextSeed);
-                regenerate(nextSeed, difficultyLevels[difficultyIndex], { shuffleTheme: true });
-              }}
-            >
-              New level
-            </button>
-            <button
-              type="button"
-              className="button button-ghost"
-              onClick={() => {
-                const nextIndex = (difficultyIndex + 1) % difficultyLevels.length;
-                setDifficultyIndex(nextIndex);
-                regenerate(seedText, difficultyLevels[nextIndex], { shuffleTheme: true });
-              }}
-              aria-label="Difficulty"
-              title="Difficulty"
-            >
-              {difficultyLevels[difficultyIndex].charAt(0).toUpperCase() +
-                difficultyLevels[difficultyIndex].slice(1)}
-            </button>
+      {isHome ? (
+        <section className="home-screen">
+          <div className="home-stack">
+            <h1 className="home-title">
+              <Logo className="logo--home" />
+            </h1>
+            <div className="home-modes">
+              <button
+                type="button"
+                className="mode-card"
+                onClick={() => setScreen("endless")}
+              >
+                <div className="mode-graphic mode-graphic-endless" aria-hidden="true">
+                  <i className="loader loader--3" aria-hidden="true" />
+                </div>
+                <div className="mode-content">
+                  <div className="mode-title">Endless</div>
+                  <p className="mode-copy">
+                    A continuous stream of randomly generated boards with no set end point.
+                  </p>
+                </div>
+              </button>
+              <button
+                type="button"
+                className="mode-card"
+                onClick={() => setScreen("progress")}
+              >
+                <div className="mode-graphic mode-graphic-progression" aria-hidden="true">
+                  <i className="loader loader--8" aria-hidden="true" />
+                </div>
+                <div className="mode-content">
+                  <div className="mode-title">Progressive</div>
+                  <p className="mode-copy">
+                    A guided journey through curated boards with increasing complexity and unlocks.
+                  </p>
+                </div>
+              </button>
+            </div>
           </div>
-          <div className="header-audio audio-controls">
-            <button
-              type="button"
-              className="button button-ghost button-icon"
-              onClick={() =>
-                setBgVolume((prev) => (prev === 0.6 ? 0 : prev === 0 ? 0.2 : prev === 0.2 ? 0.4 : 0.6))
+          <div className="home-bottom">
+            {showInstallBanner ? (
+              <InstallBanner onInstall={handleInstallClick} onDismiss={handleInstallDismiss} />
+            ) : null}
+            <ControlStack
+              themeMode={themeMode}
+              themeIndex={themeIndex}
+              themes={themes}
+              unlockedThemeLevels={progressCompletedSet}
+              showThemePicker={showThemePicker}
+              themePickerMounted={themePickerMounted}
+              onTogglePicker={toggleThemePicker}
+              onSelectRandom={selectRandomTheme}
+              onSelectTheme={selectFixedTheme}
+              bgVolume={bgVolume}
+              fxVolume={fxVolume}
+              onToggleBg={() =>
+                setBgVolume((prev) =>
+                  prev === 0.6 ? 0 : prev === 0 ? 0.2 : prev === 0.2 ? 0.4 : 0.6
+                )
               }
-              aria-label="Background volume"
-              title="Background volume"
-            >
-              <span>BG</span>
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M4 9h3l4-3v12l-4-3H4z" fill="currentColor" />
-                {bgVolume >= 0.2 ? (
-                  <path
-                    d="M13.5 10a2.5 2.5 0 010 4"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="1.8"
-                    strokeLinecap="round"
-                    strokeOpacity="0.55"
-                  />
-                ) : null}
-                {bgVolume >= 0.4 ? (
-                  <path
-                    d="M15.5 8a4.5 4.5 0 010 8"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="1.8"
-                    strokeLinecap="round"
-                    strokeOpacity="0.75"
-                  />
-                ) : null}
-                {bgVolume >= 0.6 ? (
-                  <path
-                    d="M17.5 6a6.5 6.5 0 010 12"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="1.8"
-                    strokeLinecap="round"
-                    strokeOpacity="0.9"
-                  />
-                ) : null}
-              </svg>
-            </button>
-            <button
-              type="button"
-              className="button button-ghost button-icon"
-              onClick={() =>
+              onToggleFx={() =>
                 setFxVolume((prev) =>
                   prev === 2.5 ? 0 : prev === 1.6 ? 2.5 : prev === 0 ? 0.6 : prev === 0.6 ? 1.2 : 2.5
                 )
               }
-              aria-label="Effects volume"
-              title="Effects volume"
-            >
-              <span>FX</span>
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M4 9h3l4-3v12l-4-3H4z" fill="currentColor" />
-                {fxVolume >= 0.6 ? (
-                  <path
-                    d="M13.5 10a2.5 2.5 0 010 4"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="1.8"
-                    strokeLinecap="round"
-                    strokeOpacity="0.55"
-                  />
-                ) : null}
-                {fxVolume >= 1.2 ? (
-                  <path
-                    d="M15.5 8a4.5 4.5 0 010 8"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="1.8"
-                    strokeLinecap="round"
-                    strokeOpacity="0.75"
-                  />
-                ) : null}
-                {fxVolume >= 2.5 ? (
-                  <path
-                    d="M17.5 6a6.5 6.5 0 010 12"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="1.8"
-                    strokeLinecap="round"
-                    strokeOpacity="0.9"
-                  />
-                ) : null}
-              </svg>
-            </button>
-          </div>
-        </div>
-      </header>
-
-      <main className="board-wrap">
-        {showSuccess ? (
-          <div className="success-overlay">
-            <div className="success-confetti">
-              {Array.from({ length: confettiCount }).map((_, idx) => {
-                const palette = themes[themeIndex]?.colors || themes[0].colors;
-                const color = palette[idx % palette.length];
-                const size = 6 + (idx % 5) * 3 + (idx % 2);
-                const drift = (idx % 2 === 0 ? 1 : -1) * (12 + (idx % 7) * 6);
-                const rotate = (idx % 8) * 18;
-                const delay = (idx % 20) * 45;
-                const duration = 1600 + (idx % 10) * 140;
-                const radius = idx % 5 === 0 ? "999px" : "2px";
-                return (
-                  <span
-                    key={idx}
-                    className="confetti-piece"
-                    style={{
-                      "--confetti-x": `${(idx % 24) * 4 + 2}%`,
-                      "--confetti-delay": `${delay}ms`,
-                      "--confetti-duration": `${duration}ms`,
-                      "--confetti-size": `${size}px`,
-                      "--confetti-rotate": `${rotate}deg`,
-                      "--confetti-color": color,
-                      "--confetti-drift": `${drift}px`,
-                      "--confetti-radius": radius
-                    }}
-                  />
-                );
-              })}
+              nowPlaying={audioTracks[bgNowPlayingIndex]?.title}
+              onPrev={playPrevBg}
+              onNext={playNextBg}
+              onTogglePlay={toggleBgPlay}
+              isPaused={isBgPaused}
+              isLoading={isBgLoading}
+              performanceMode={performanceMode}
+              onTogglePerformance={() => setPerformanceMode((prev) => !prev)}
+              audioAttribution={audioAttribution}
+            />
+            {builderUnlocked ? (
+            <div className="home-builder">
+              <button
+                type="button"
+                className="mode-card mode-card-builder mode-card-no-graphic"
+                onClick={() => setScreen("progression")}
+              >
+                <div className="mode-content">
+                  <div className="mode-title">Level Builder</div>
+                  <p className="mode-copy">
+                    Build a 96-level journey with sliders and seeds.
+                  </p>
+                </div>
+              </button>
             </div>
-            <div className="success-card">
-              <div className="success-icon">
-                <div className="success-diamond">
-                  <svg viewBox="0 0 24 24" aria-hidden="true">
-                    <path d="M6 12l4 4 8-8" fill="none" stroke="currentColor" strokeWidth="2.6" strokeLinecap="round" strokeLinejoin="round" />
-                  </svg>
+            ) : null}
+          </div>
+        </section>
+      ) : isProgression ? (
+        <>
+          <header className="top-controls">
+            <div className="header-title-row">
+              <button
+                type="button"
+                className="button button-ghost home-icon"
+                onClick={() => setScreen("home")}
+                aria-label="Back to home"
+                title="Back to home"
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path
+                    d="M4 11.5l8-7 8 7"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                  <path
+                    d="M6.5 10.5V20h11V10.5"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                </svg>
+              </button>
+              <h1 className="app-title">Progression Builder</h1>
+              <button
+                type="button"
+                className="button button-ghost home-icon builder-reset"
+                onClick={handleResetProgression}
+                aria-label="Reset progression"
+                title="Reset progression"
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path
+                    d="M17 7a7 7 0 1 0 1.9 6.3"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2.2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                  <path
+                    d="M19 4.5v4.8h-4.8"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2.2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                </svg>
+              </button>
+            </div>
+            <p className="builder-subhead">
+              Dial in the sliders, grab the seed, and assign it to levels 1-96.
+            </p>
+          </header>
+
+          <section className="builder-layout">
+            <main className="board-wrap builder-board">
+              <div className="builder-board-stack">
+                <div className="builder-level-nav" aria-live="polite">
+                  <button
+                    type="button"
+                    className="button button-ghost builder-level-step"
+                    onClick={() => navigateBuilderLevel(-1)}
+                    disabled={builderLevelDisplay <= 1}
+                    aria-label="Previous level"
+                  >
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                      <path
+                        d="M15 6l-6 6 6 6"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2.4"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      />
+                    </svg>
+                  </button>
+                  <div
+                    className={`button level-toggle builder-level-title${
+                      builderLevelHasSeed ? "" : " is-missing"
+                    }`}
+                  >
+                    <span className="level-toggle-label">Level {builderLevelDisplay}</span>
+                  </div>
+                  <button
+                    type="button"
+                    className="button button-ghost builder-level-step"
+                    onClick={() => navigateBuilderLevel(1)}
+                    disabled={builderLevelDisplay >= TOTAL_LEVELS}
+                    aria-label="Next level"
+                  >
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                      <path
+                        d="M9 6l6 6-6 6"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2.4"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      />
+                    </svg>
+                  </button>
+                </div>
+                <div
+                  className="board"
+                  style={{
+                    "--cols": COLS,
+                    "--rows": ROWS
+                  }}
+                >
+                  {builderTiles.map((tile, index) => (
+                    <Tile
+                      key={tile.id}
+                      tile={{
+                        ...tile,
+                        completeDirs: builderCompleteDirs.get(tile.id),
+                        waveActive: false
+                      }}
+                      onRotate={() => rotateBuilderTile(index)}
+                    />
+                  ))}
                 </div>
               </div>
-              <p className="success-title">{successMessage}</p>
-              <div className="success-actions">
+            </main>
+
+            <aside className="builder-panel">
+              <div className="builder-section">
+                <div className="builder-section-header">
+                  <span className="label">Seed</span>
+                  {seedParseError ? <span className="builder-chip">Invalid</span> : null}
+                  {builderCopyNotice ? <span className="builder-chip">Copied</span> : null}
+                </div>
+                <div className="builder-seed-row">
+                  <input
+                    type="text"
+                    className="builder-seed-code builder-seed-input"
+                    value={builderSeedDraft}
+                    onFocus={() => {
+                      seedEditingRef.current = true;
+                    }}
+                    onBlur={() => {
+                      seedEditingRef.current = false;
+                      applyBuilderSeedDraft();
+                    }}
+                    onChange={(event) => setBuilderSeedDraft(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        event.preventDefault();
+                        const ok = applyBuilderSeedDraft();
+                        if (ok) event.currentTarget.blur();
+                      }
+                      if (event.key === "Escape") {
+                        setBuilderSeedDraft(builderSeed);
+                        setSeedParseError("");
+                        event.currentTarget.blur();
+                      }
+                    }}
+                  />
+                  <button
+                    type="button"
+                    className="button button-ghost builder-action"
+                    onClick={handleCopyBuilderSeed}
+                  >
+                    Copy
+                  </button>
+                  <button
+                    type="button"
+                    className="button button-ghost builder-action"
+                    onClick={rollBuilderVariant}
+                  >
+                    Shuffle
+                  </button>
+                </div>
+                <p className="builder-note">
+                  Seed encodes slider settings plus the variant.
+                </p>
+              </div>
+
+              <div className="builder-section builder-assign">
+                <div className="builder-section-header">
+                  <span className="label">Assign Level</span>
+                  {assignedSeedForLevel ? (
+                    <span className="builder-chip">Overwriting</span>
+                  ) : null}
+                </div>
+                <div className="builder-assign-row">
+                  <input
+                    type="number"
+                    className="input"
+                    min="1"
+                    max={TOTAL_LEVELS}
+                    step="1"
+                    inputMode="numeric"
+                    value={builderLevel}
+                    onChange={(event) => setBuilderLevel(event.target.value)}
+                  />
+                  <button
+                    type="button"
+                    className="button"
+                    onClick={handleAssignLevel}
+                    disabled={!levelIsValid}
+                  >
+                    Assign
+                  </button>
+                  <button
+                    type="button"
+                    className="button button-ghost builder-action"
+                    onClick={() => handleClearLevel(levelNumber)}
+                    disabled={!levelIsValid || !assignedSeedForLevel}
+                  >
+                    Clear
+                  </button>
+                </div>
+                <p className="builder-note">
+                  Assigns the current seed to the selected level.
+                </p>
+              </div>
+
+              <div className="builder-section builder-sliders">
+                <div className="builder-slider">
+                  <div className="builder-slider-header">
+                    <span className="label">Gap Frequency</span>
+                    <span className="builder-slider-value">
+                      <input
+                        type="number"
+                        className="builder-number"
+                        min={PROGRESSION_SETTINGS_RANGES.gapRate.min}
+                        max={PROGRESSION_SETTINGS_RANGES.gapRate.max}
+                        step="1"
+                        value={builderSettings.gapRate}
+                        onChange={(event) =>
+                          updateBuilderSetting("gapRate", Number(event.target.value))
+                        }
+                      />
+                      <span className="builder-value-suffix">
+                        % (eff {effectiveGapRate}%) / {builderConfig.blanks.min} gaps · {builderTileCount} tiles
+                      </span>
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={PROGRESSION_SETTINGS_RANGES.gapRate.min}
+                    max={PROGRESSION_SETTINGS_RANGES.gapRate.max}
+                    value={builderSettings.gapRate}
+                    onChange={(event) =>
+                      updateBuilderSetting("gapRate", Number(event.target.value))
+                    }
+                  />
+                  <div className="builder-input-row">
+                    <span className="builder-input-label">Tiles</span>
+                    <input
+                      type="number"
+                      className="builder-number"
+                      min={MIN_TILES}
+                      max={totalCells}
+                      step="1"
+                      value={builderTileCount}
+                      onChange={(event) => setGapRateFromTileCount(event.target.value)}
+                    />
+                    <span className="builder-input-label">Gaps</span>
+                    <input
+                      type="number"
+                      className="builder-number"
+                      min="0"
+                      max={maxBlankCells}
+                      step="1"
+                      value={builderConfig.blanks.min}
+                      onChange={(event) => setGapRateFromGapCells(event.target.value)}
+                    />
+                  </div>
+                  <p className="builder-slider-note">
+                    More gaps = easier. Gap counts snap to multiples of 4.
+                  </p>
+                </div>
+
+                <div className="builder-slider">
+                  <div className="builder-slider-header">
+                    <span className="label">Gap Clustering</span>
+                    <span className="builder-slider-value">
+                      <input
+                        type="number"
+                        className="builder-number"
+                        min={PROGRESSION_SETTINGS_RANGES.gapClusters.min}
+                        max={PROGRESSION_SETTINGS_RANGES.gapClusters.max}
+                        step="1"
+                        value={builderSettings.gapClusters}
+                        onChange={(event) =>
+                          updateBuilderSetting("gapClusters", Number(event.target.value))
+                        }
+                      />
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={PROGRESSION_SETTINGS_RANGES.gapClusters.min}
+                    max={PROGRESSION_SETTINGS_RANGES.gapClusters.max}
+                    value={builderSettings.gapClusters}
+                    onChange={(event) =>
+                      updateBuilderSetting("gapClusters", Number(event.target.value))
+                    }
+                  />
+                  <p className="builder-slider-note">
+                    Higher values clump gaps together.
+                  </p>
+                </div>
+
+                <div className="builder-slider">
+                  <div className="builder-slider-header">
+                    <span className="label">Tile Centrality</span>
+                    <span className="builder-slider-value">
+                      <input
+                        type="number"
+                        className="builder-number"
+                        min={PROGRESSION_SETTINGS_RANGES.centerBias.min}
+                        max={PROGRESSION_SETTINGS_RANGES.centerBias.max}
+                        step="1"
+                        value={builderSettings.centerBias}
+                        onChange={(event) =>
+                          updateBuilderSetting("centerBias", Number(event.target.value))
+                        }
+                      />
+                      <span className="builder-value-suffix">% centered</span>
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={PROGRESSION_SETTINGS_RANGES.centerBias.min}
+                    max={PROGRESSION_SETTINGS_RANGES.centerBias.max}
+                    value={builderSettings.centerBias}
+                    onChange={(event) =>
+                      updateBuilderSetting("centerBias", Number(event.target.value))
+                    }
+                  />
+                  <p className="builder-slider-note">
+                    0 = chaotic spread, 100 = tight center focus.
+                  </p>
+                </div>
+
+                <div className="builder-slider">
+                  <div className="builder-slider-header">
+                    <span className="label">Curve Bias</span>
+                    <span className="builder-slider-value">
+                      <input
+                        type="number"
+                        className="builder-number"
+                        min={PROGRESSION_SETTINGS_RANGES.curveBias.min}
+                        max={PROGRESSION_SETTINGS_RANGES.curveBias.max}
+                        step="1"
+                        value={builderSettings.curveBias}
+                        onChange={(event) =>
+                          updateBuilderSetting("curveBias", Number(event.target.value))
+                        }
+                      />
+                      <span className="builder-value-suffix">% target</span>
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={PROGRESSION_SETTINGS_RANGES.curveBias.min}
+                    max={PROGRESSION_SETTINGS_RANGES.curveBias.max}
+                    value={builderSettings.curveBias}
+                    onChange={(event) =>
+                      updateBuilderSetting("curveBias", Number(event.target.value))
+                    }
+                  />
+                  <p className="builder-slider-note">More curves = trickier.</p>
+                </div>
+
+                <div className="builder-slider">
+                  <div className="builder-slider-header">
+                    <span className="label">Terminal Density</span>
+                    <span className="builder-slider-value">
+                      <input
+                        type="number"
+                        className="builder-number"
+                        min={PROGRESSION_SETTINGS_RANGES.terminalRate.min}
+                        max={PROGRESSION_SETTINGS_RANGES.terminalRate.max}
+                        step="1"
+                        value={builderSettings.terminalRate}
+                        onChange={(event) =>
+                          updateBuilderSetting("terminalRate", Number(event.target.value))
+                        }
+                      />
+                      <span className="builder-value-suffix">
+                        % / {builderConfig.minTerminals}-{builderConfig.maxTerminals}
+                      </span>
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={PROGRESSION_SETTINGS_RANGES.terminalRate.min}
+                    max={PROGRESSION_SETTINGS_RANGES.terminalRate.max}
+                    value={builderSettings.terminalRate}
+                    onChange={(event) =>
+                      updateBuilderSetting("terminalRate", Number(event.target.value))
+                    }
+                  />
+                  <p className="builder-slider-note">
+                    More terminals add structure.
+                  </p>
+                </div>
+
+                <div className="builder-slider">
+                  <div className="builder-slider-header">
+                    <span className="label">Terminal Spacing</span>
+                    <span className="builder-slider-value">
+                      <input
+                        type="number"
+                        className="builder-number"
+                        min={PROGRESSION_SETTINGS_RANGES.terminalSpacing.min}
+                        max={PROGRESSION_SETTINGS_RANGES.terminalSpacing.max}
+                        step="1"
+                        value={builderSettings.terminalSpacing}
+                        onChange={(event) =>
+                          updateBuilderSetting("terminalSpacing", Number(event.target.value))
+                        }
+                      />
+                      <span className="builder-value-suffix">tiles apart</span>
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={PROGRESSION_SETTINGS_RANGES.terminalSpacing.min}
+                    max={PROGRESSION_SETTINGS_RANGES.terminalSpacing.max}
+                    value={builderSettings.terminalSpacing}
+                    onChange={(event) =>
+                      updateBuilderSetting("terminalSpacing", Number(event.target.value))
+                    }
+                  />
+                  <p className="builder-slider-note">
+                    Higher spacing keeps terminals separated.
+                  </p>
+                </div>
+
+                <div className="builder-slider">
+                  <div className="builder-slider-header">
+                    <span className="label">Max Straight Run</span>
+                    <span className="builder-slider-value">
+                      <input
+                        type="number"
+                        className="builder-number"
+                        min={PROGRESSION_SETTINGS_RANGES.straightRunMax.min}
+                        max={PROGRESSION_SETTINGS_RANGES.straightRunMax.max}
+                        step="1"
+                        value={builderSettings.straightRunMax}
+                        onChange={(event) =>
+                          updateBuilderSetting("straightRunMax", Number(event.target.value))
+                        }
+                      />
+                      <span className="builder-value-suffix">tiles</span>
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={PROGRESSION_SETTINGS_RANGES.straightRunMax.min}
+                    max={PROGRESSION_SETTINGS_RANGES.straightRunMax.max}
+                    value={builderSettings.straightRunMax}
+                    onChange={(event) =>
+                      updateBuilderSetting("straightRunMax", Number(event.target.value))
+                    }
+                  />
+                  <p className="builder-slider-note">
+                    Lower values force more turns.
+                  </p>
+                </div>
+
+                <div className="builder-slider">
+                  <div className="builder-slider-header">
+                    <span className="label">Empty Row Run</span>
+                    <span className="builder-slider-value">
+                      <input
+                        type="number"
+                        className="builder-number"
+                        min={PROGRESSION_SETTINGS_RANGES.emptyRowMax.min}
+                        max={PROGRESSION_SETTINGS_RANGES.emptyRowMax.max}
+                        step="1"
+                        value={builderSettings.emptyRowMax}
+                        onChange={(event) =>
+                          updateBuilderSetting("emptyRowMax", Number(event.target.value))
+                        }
+                      />
+                      <span className="builder-value-suffix">rows</span>
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={PROGRESSION_SETTINGS_RANGES.emptyRowMax.min}
+                    max={PROGRESSION_SETTINGS_RANGES.emptyRowMax.max}
+                    value={builderSettings.emptyRowMax}
+                    onChange={(event) =>
+                      updateBuilderSetting("emptyRowMax", Number(event.target.value))
+                    }
+                  />
+                  <p className="builder-slider-note">
+                    Limits consecutive fully empty rows.
+                  </p>
+                </div>
+
+                <div className="builder-slider">
+                  <div className="builder-slider-header">
+                    <span className="label">Empty Col Run</span>
+                    <span className="builder-slider-value">
+                      <input
+                        type="number"
+                        className="builder-number"
+                        min={PROGRESSION_SETTINGS_RANGES.emptyColMax.min}
+                        max={PROGRESSION_SETTINGS_RANGES.emptyColMax.max}
+                        step="1"
+                        value={builderSettings.emptyColMax}
+                        onChange={(event) =>
+                          updateBuilderSetting("emptyColMax", Number(event.target.value))
+                        }
+                      />
+                      <span className="builder-value-suffix">cols</span>
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={PROGRESSION_SETTINGS_RANGES.emptyColMax.min}
+                    max={PROGRESSION_SETTINGS_RANGES.emptyColMax.max}
+                    value={builderSettings.emptyColMax}
+                    onChange={(event) =>
+                      updateBuilderSetting("emptyColMax", Number(event.target.value))
+                    }
+                  />
+                  <p className="builder-slider-note">
+                    Limits consecutive fully empty columns.
+                  </p>
+                </div>
+
+                <div className="builder-slider">
+                  <div className="builder-slider-header">
+                    <span className="label">Seed Variant</span>
+                    <span className="builder-slider-value">
+                      <input
+                        type="number"
+                        className="builder-number"
+                        min={PROGRESSION_SETTINGS_RANGES.variant.min}
+                        max={PROGRESSION_SETTINGS_RANGES.variant.max}
+                        step="1"
+                        value={builderSettings.variant}
+                        onChange={(event) =>
+                          updateBuilderSetting("variant", Number(event.target.value))
+                        }
+                      />
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={PROGRESSION_SETTINGS_RANGES.variant.min}
+                    max={PROGRESSION_SETTINGS_RANGES.variant.max}
+                    value={builderSettings.variant}
+                    onChange={(event) =>
+                      updateBuilderSetting("variant", Number(event.target.value))
+                    }
+                  />
+                  <p className="builder-slider-note">
+                    Alternate layout without changing sliders.
+                  </p>
+                </div>
+              </div>
+            </aside>
+          </section>
+
+          <section className="floating-controls builder-footer">
+            <div className="builder-panel builder-map-panel">
+              <div className="builder-section builder-export">
+                <div className="builder-section-header">
+                  <span className="label">Export</span>
+                </div>
+                <div className="builder-export-row">
+                  <button type="button" className="button" onClick={handleExportLevelsJSON}>
+                    Export JSON
+                  </button>
+                  <button
+                    type="button"
+                    className="button button-ghost builder-action"
+                    onClick={handleExportLevelsCSV}
+                  >
+                    Export CSV
+                  </button>
+                </div>
+                <p className="builder-note">
+                  Exports all {TOTAL_LEVELS} levels (blank seeds stay blank).
+                </p>
+              </div>
+
+              <div className="builder-section builder-save">
+                <div className="builder-section-header">
+                  <span className="label">Save Levels</span>
+                  {saveNotice ? <span className="builder-chip">Saved</span> : null}
+                  {!saveNotice && hasUnsavedLevels ? (
+                    <span className="builder-chip">Unsaved</span>
+                  ) : null}
+                </div>
+                <div className="builder-export-row">
+                  <button
+                    type="button"
+                    className="button"
+                    onClick={handleSaveLevels}
+                    disabled={isBaking}
+                  >
+                    {isBaking ? "Saving..." : "Save"}
+                  </button>
+                </div>
+                <p className="builder-note">
+                  Writes the current map into the game source.
+                  {lastSavedLabel ? ` Last saved ${lastSavedLabel}.` : ""}
+                </p>
+              </div>
+
+              <div className="builder-section builder-levels">
+                <div className="builder-levels-header">
+                  <span className="label">Level Map</span>
+                  <span className="builder-count">
+                    {assignedCount}/{TOTAL_LEVELS}
+                  </span>
+                </div>
+                <p className="builder-note">
+                  Paste seeds directly into any level and click Save.
+                </p>
+                <ul className="builder-level-list">
+                  {levelEntries.map(({ level, seed }) => (
+                    <li key={level} className="builder-level-item">
+                      <span className="builder-level-number">Level {level}</span>
+                      <input
+                        type="text"
+                        className="builder-level-seed builder-seed-input"
+                        value={seed}
+                        placeholder="Paste seed…"
+                        onChange={(event) => {
+                          const nextSeed = event.target.value;
+                          setProgressionLevels((prev) => {
+                            const next = [...prev];
+                            next[level - 1] = nextSeed.trim();
+                            return next;
+                          });
+                        }}
+                        onBlur={(event) => {
+                          const parsed = parseProgressionSeed(event.target.value.trim());
+                          if (!parsed && event.target.value.trim() !== "") {
+                            event.target.classList.add("is-invalid");
+                          } else {
+                            event.target.classList.remove("is-invalid");
+                          }
+                        }}
+                      />
+                      <div className="builder-level-actions">
+                        <button
+                          type="button"
+                          className="button button-ghost builder-action"
+                          onClick={() => handleLoadLevelSeed(seed, level)}
+                          disabled={!seed}
+                        >
+                          Load
+                        </button>
+                        <button
+                          type="button"
+                          className="button button-ghost builder-action"
+                          onClick={() => handleClearLevel(level)}
+                          disabled={!seed}
+                        >
+                          Clear
+                        </button>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+
+            </div>
+          </section>
+        </>
+      ) : (
+        <>
+          <header className="top-controls">
+            <div className="header-title-row">
+              <span className="header-title-spacer" aria-hidden="true" />
+              <h1 className="app-title">
+                <Logo
+                  className="logo--header"
+                  interactive
+                  onClick={solveAllButOne}
+                  ariaLabel="Solve all but one tile"
+                  title="Solve all but one tile"
+                />
+              </h1>
+              <span className="header-title-spacer" aria-hidden="true" />
+            </div>
+            <div className="header-controls header-controls-bottom">
+              <div className="header-actions">
                 <button
                   type="button"
-                  className="button success-action"
-                  onClick={() => {
-                    setShowSuccess(false);
-                    regenerate(seedText, difficultyLevels[difficultyIndex], { shuffleTheme: false });
-                  }}
+                  className="button button-ghost home-icon"
+                  onClick={() => setScreen("home")}
+                  aria-label="Back to home"
+                  title="Back to home"
                 >
-                  Reset
-                </button>
-                <button
-                  type="button"
-                  className="button button-ghost success-action"
-                  onClick={() => {
-                    setShowSuccess(false);
-                    const nextSeed = Math.random().toString(36).slice(2, 8);
-                    setSeedText(nextSeed);
-                    regenerate(nextSeed, difficultyLevels[difficultyIndex], { shuffleTheme: true });
-                  }}
-                >
-                  New level
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path
+                      d="M4 11.5l8-7 8 7"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    />
+                    <path
+                      d="M6.5 10.5V20h11V10.5"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    />
+                  </svg>
                 </button>
               </div>
+              {isProgress && progressLevelsAvailable ? (
+                <div className="header-level-inline" aria-live="polite">
+                  <button
+                    type="button"
+                    className={`level-toggle${showLevelPicker ? " is-active" : ""}`}
+                    onClick={toggleLevelPicker}
+                    aria-label={showLevelPicker ? "Hide level picker" : "Show level picker"}
+                    title={showLevelPicker ? "Hide levels" : "Show levels"}
+                    aria-pressed={showLevelPicker}
+                  >
+                    <span className="level-toggle-label">Level {progressLevelNumber}</span>
+                    <span className="level-toggle-icon" aria-hidden="true">
+                      <span className="level-toggle-mid" aria-hidden="true" />
+                    </span>
+                  </button>
+                </div>
+              ) : null}
+              <div className="header-actions header-actions-right">
+                <button
+                  type="button"
+                  className={`button${resetSpinning ? " reset-spin" : ""}`}
+                  onClick={() => {
+                    if (resetDisabled || (isProgress && !progressLevelsAvailable)) return;
+                    setResetSpinning(true);
+                    window.setTimeout(() => setResetSpinning(false), 420);
+                    const nextSeed = isProgress ? progressSeed : seedText;
+                    if (!nextSeed) return;
+                    setSeedText(nextSeed);
+                    regenerate(nextSeed, difficultyLevels[difficultyIndex], { shuffleTheme: false });
+                  }}
+                  aria-label="Reset level"
+                  title="Reset"
+                  disabled={resetDisabled || (isProgress && !progressLevelsAvailable)}
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path
+                      d="M17 7a7 7 0 1 0 1.9 6.3"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2.6"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    />
+                    <path
+                      d="M19 4.5v4.8h-4.8"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2.6"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    />
+                  </svg>
+                </button>
+                {isEndless ? (
+                  <>
+                    <button
+                      type="button"
+                      className="button button-ghost"
+                      onClick={() => {
+                        const nextSeed = Math.random().toString(36).slice(2, 8);
+                        setSeedText(nextSeed);
+                        regenerate(nextSeed, difficultyLevels[difficultyIndex], { shuffleTheme: true });
+                      }}
+                    >
+                      New level
+                    </button>
+                    <button
+                      type="button"
+                      className="button button-ghost"
+                      onClick={() => {
+                        const nextIndex = (difficultyIndex + 1) % difficultyLevels.length;
+                        setDifficultyIndex(nextIndex);
+                        regenerate(seedText, difficultyLevels[nextIndex], { shuffleTheme: true });
+                      }}
+                      aria-label="Difficulty"
+                      title="Difficulty"
+                    >
+                      {difficultyLevels[difficultyIndex].charAt(0).toUpperCase() +
+                        difficultyLevels[difficultyIndex].slice(1)}
+                    </button>
+                  </>
+                ) : null}
+              </div>
             </div>
-          </div>
-        ) : null}
-        <div
-          className="board"
-          style={{
-            "--cols": COLS,
-            "--rows": ROWS
-          }}
-        >
-          {tiles.map((tile, index) => (
-            <Tile
-              key={tile.id}
-              tile={{
-                ...tile,
-                completeDirs: completeDirs.get(tile.id),
-                pulseDelay: pulseDelays.get(tile.id),
-                waveDelay: waveDelays.get(tile.id),
-                waveActive
-              }}
-              onRotate={() => rotateTile(index)}
-            />
-          ))}
-        </div>
-      </main>
+          </header>
 
-      <section className="floating-controls">
-        <div className="theme-panel theme-panel-card">
-          <p className="theme-title">Theme</p>
-          <div className="theme-summary">
-            <span className="theme-label">
-              {themeMode === "random"
-                ? "Random"
-                : themes[themeIndex]?.name || "Theme"}
-            </span>
-            <span className="theme-swatches">
-              {themeMode === "random" ? (
-                <span className="theme-swatch theme-swatch-random" />
-              ) : (
-                (themes[themeIndex]?.colors || themes[0].colors)
-                  .slice(0, 1)
-                  .map((color) => (
-                    <span key={color} className="theme-swatch" style={{ background: color }} />
-                  ))
-              )}
-            </span>
-          </div>
-          <button
-            type="button"
-            className="button button-ghost theme-toggle theme-toggle-full"
-            onClick={() => {
-              if (showThemePicker) {
-                setShowThemePicker(false);
-                window.setTimeout(() => setThemePickerMounted(false), 260);
-              } else {
-                setThemePickerMounted(true);
-                window.requestAnimationFrame(() => setShowThemePicker(true));
-              }
-            }}
-          >
-            {showThemePicker ? "Close" : "Change theme"}
-          </button>
-          {themePickerMounted ? (
-            <div className={`theme-accordion${showThemePicker ? " is-open" : ""}`}>
-            <button
-              type="button"
-              className={`theme-button theme-button-wide${themeMode === "random" ? " is-active is-random" : ""}`}
-              onClick={() => {
-                setThemeMode("random");
-                setShowThemePicker(false);
-                window.setTimeout(() => setThemePickerMounted(false), 260);
-              }}
-            >
-              <span className="theme-label">Random</span>
-              <span className="theme-swatches">
-                <span className="theme-swatch theme-swatch-random" />
-              </span>
-            </button>
-            {themes.map((theme, index) => (
-              <button
-                key={theme.name}
-                type="button"
-                className={`theme-button theme-button-wide${
-                  themeMode === "fixed" && index === themeIndex ? " is-active" : ""
-                }`}
-                onClick={() => {
-                  setThemeMode("fixed");
-                  setThemeIndex(index);
-                  clearRecentRandomThemes();
-                  setShowThemePicker(false);
-                  window.setTimeout(() => setThemePickerMounted(false), 260);
+          <main className="board-wrap">
+            {showSuccess && isBoardScreen && !showLevelPicker ? (
+              <div className="success-overlay">
+                <div className="success-confetti">
+                  {Array.from({ length: confettiCount }).map((_, idx) => {
+                    const palette = themes[themeIndex]?.colors || themes[0].colors;
+                    const color = palette[idx % palette.length];
+                    const size = 6 + (idx % 5) * 3 + (idx % 2);
+                    const drift = (idx % 2 === 0 ? 1 : -1) * (12 + (idx % 7) * 6);
+                    const rotate = (idx % 8) * 18;
+                    const delay = (idx % 20) * 45;
+                    const duration = 1600 + (idx % 10) * 140;
+                    const radius = idx % 5 === 0 ? "999px" : "2px";
+                    return (
+                      <span
+                        key={idx}
+                        className="confetti-piece"
+                        style={{
+                          "--confetti-x": `${(idx % 24) * 4 + 2}%`,
+                          "--confetti-delay": `${delay}ms`,
+                          "--confetti-duration": `${duration}ms`,
+                          "--confetti-size": `${size}px`,
+                          "--confetti-rotate": `${rotate}deg`,
+                          "--confetti-color": color,
+                          "--confetti-drift": `${drift}px`,
+                          "--confetti-radius": radius
+                        }}
+                      />
+                    );
+                  })}
+                </div>
+                <div className="success-stack">
+                  <div className="success-card">
+                    <div className="success-icon">
+                      <div className="success-diamond">
+                        <svg viewBox="0 0 24 24" aria-hidden="true">
+                          <path d="M6 12l4 4 8-8" fill="none" stroke="currentColor" strokeWidth="2.6" strokeLinecap="round" strokeLinejoin="round" />
+                        </svg>
+                      </div>
+                    </div>
+                    <p className="success-title">{successTitle}</p>
+                    <div className="success-actions">
+                      {isProgress ? (
+                        showFinalSuccess ? (
+                          <>
+                            <button
+                              type="button"
+                              className="button success-action"
+                              onClick={() => {
+                                cancelFinalAnimations();
+                                setShowFinalSuccess(false);
+                                setShowLevelPicker(false);
+                                setScreen("home");
+                              }}
+                            >
+                              Go home
+                            </button>
+                            <button
+                              type="button"
+                              className="button button-ghost success-action"
+                              onClick={() => {
+                                cancelFinalAnimations();
+                                setShowFinalSuccess(false);
+                                setShowLevelPicker(false);
+                                setScreen("endless");
+                              }}
+                            >
+                              Endless mode
+                            </button>
+                          </>
+                        ) : (
+                          <>
+                            <button
+                              type="button"
+                              className="button success-action"
+                              onClick={() => {
+                                setShowSuccess(false);
+                                if (!progressSeed) return;
+                                setSeedText(progressSeed);
+                                regenerate(progressSeed, difficultyLevels[difficultyIndex], { shuffleTheme: false });
+                              }}
+                            >
+                              Reset
+                            </button>
+                            <button
+                              type="button"
+                              className="button button-ghost success-action"
+                              disabled={!hasNextProgressLevel}
+                              onClick={() => {
+                                if (!hasNextProgressLevel) return;
+                                setShowSuccess(false);
+                                if (!nextProgressLevel) return;
+                                handleSelectProgressLevel(nextProgressLevel.level);
+                              }}
+                            >
+                              Next level
+                            </button>
+                          </>
+                        )
+                      ) : (
+                        <>
+                          <button
+                            type="button"
+                            className="button success-action"
+                            onClick={() => {
+                              setShowSuccess(false);
+                              regenerate(seedText, difficultyLevels[difficultyIndex], { shuffleTheme: false });
+                            }}
+                          >
+                            Reset
+                          </button>
+                          <button
+                            type="button"
+                            className="button button-ghost success-action"
+                            onClick={() => {
+                              setShowSuccess(false);
+                              const nextSeed = Math.random().toString(36).slice(2, 8);
+                              setSeedText(nextSeed);
+                              regenerate(nextSeed, difficultyLevels[difficultyIndex], { shuffleTheme: true });
+                            }}
+                          >
+                            New level
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                  {isProgress && unlockableThemeForLevel ? (
+                    <div className="success-unlock-card">
+                      <div className="success-unlock-copy">
+                        <span className="success-unlock-label">New theme unlocked</span>
+                        <span className="success-unlock-name">
+                          {unlockableThemeForLevel.theme.name}
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        className="button button-ghost success-unlock-cta"
+                        onClick={() => handleApplyUnlockedTheme(unlockableThemeForLevel.index)}
+                      >
+                        {successThemeApplied ? "Undo" : "Apply theme"}
+                      </button>
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+            ) : null}
+            {isProgress && showLevelPicker ? (
+              <div className="level-picker">
+                {progressLevelsAvailable ? (
+                  <>
+                    {isProgressionComplete ? (
+                      <div className="level-picker-banner">
+                        <div className="level-picker-banner-copy">
+                          <p className="level-picker-banner-title">Congratulations</p>
+                          <p className="level-picker-banner-text">
+                            Would you like to reset your progression?
+                          </p>
+                        </div>
+                        <button
+                          type="button"
+                          className="button"
+                          onClick={handleResetProgression}
+                        >
+                          Reset
+                        </button>
+                      </div>
+                    ) : null}
+                    <div className="level-grid">
+                      {Array.from({ length: TOTAL_LEVELS }, (_, index) => {
+                        const level = index + 1;
+                        const seed = progressionLevels[index];
+                        const hasSeed = Boolean(seed);
+                        const isUnlocked = level <= progressUnlockedLevel;
+                        const isComplete = progressCompletedSet.has(level);
+                        const hasThemeUnlock = themeUnlockMap.has(level);
+                        const themeUnlocked = hasThemeUnlock && isComplete;
+                        const isAvailable = hasSeed && isUnlocked;
+                        const state = isComplete
+                          ? "complete"
+                          : isAvailable
+                            ? "available"
+                            : "unavailable";
+                        return (
+                          <button
+                            key={level}
+                            type="button"
+                            className="level-card"
+                            data-state={state}
+                            disabled={!isAvailable}
+                            onClick={() => handleSelectProgressLevel(level)}
+                            aria-label={`Level ${level} ${state}`}
+                            title={`Level ${level}`}
+                          >
+                            {hasThemeUnlock ? (
+                              themeUnlocked ? (
+                                <span className="level-check" aria-hidden="true">
+                                  <svg viewBox="0 0 24 24">
+                                    <path
+                                      d="M6 12l4 4 8-8"
+                                      fill="none"
+                                      stroke="currentColor"
+                                      strokeWidth="2.6"
+                                      strokeLinecap="round"
+                                      strokeLinejoin="round"
+                                    />
+                                  </svg>
+                                </span>
+                              ) : (
+                                <span className="level-theme-lock" aria-hidden="true">
+                                  <svg viewBox="0 0 24 24">
+                                    <path
+                                      d="M7 11V8.5a5 5 0 0 1 10 0V11"
+                                      fill="none"
+                                      stroke="currentColor"
+                                      strokeWidth="1.8"
+                                      strokeLinecap="round"
+                                    />
+                                    <rect
+                                      x="5.5"
+                                      y="11"
+                                      width="13"
+                                      height="9"
+                                      rx="2.2"
+                                      fill="none"
+                                      stroke="currentColor"
+                                      strokeWidth="1.8"
+                                    />
+                                  </svg>
+                                </span>
+                              )
+                            ) : isComplete ? (
+                              <span className="level-check" aria-hidden="true">
+                                <svg viewBox="0 0 24 24">
+                                  <path
+                                    d="M6 12l4 4 8-8"
+                                    fill="none"
+                                    stroke="currentColor"
+                                    strokeWidth="2.6"
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                  />
+                                </svg>
+                              </span>
+                            ) : null}
+                            <span className="level-number">{level}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </>
+                ) : (
+                  <p className="builder-empty">No progress levels assigned yet.</p>
+                )}
+              </div>
+            ) : isProgress && !progressLevelsAvailable ? (
+              <p className="builder-empty">No progress levels assigned yet.</p>
+            ) : (
+              <div
+                className="board"
+                style={{
+                  "--cols": COLS,
+                  "--rows": ROWS
                 }}
               >
-                <span className="theme-label">{theme.name}</span>
-                <span className="theme-swatches">
-                  {theme.colors.slice(0, 1).map((color) => (
-                    <span key={color} className="theme-swatch" style={{ background: color }} />
-                  ))}
-                </span>
-              </button>
-            ))}
-            </div>
-          ) : null}
-        </div>
-        <div className="player-card">
-          <div className="player-info">
-            <p className="player-label">Now Playing</p>
-            <p className="player-title">
-              {audioTracks[bgNowPlayingIndex]?.title || "—"}
-            </p>
-          </div>
-          <div className="player-controls">
-            <button type="button" className="player-button" onClick={playPrevBg} aria-label="Previous track">
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M7 6v12M19 6l-8 6 8 6" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
-            </button>
-              <button
-                type="button"
-                className="player-button player-button-main"
-                onClick={() => {
-                  if (bgAudioRef.current) {
-                    if (bgAudioRef.current.paused) {
-                      bgUserPausedRef.current = false;
-                      bgAudioRef.current.play().catch(() => {});
-                    } else {
-                      bgUserPausedRef.current = true;
-                      bgAudioRef.current.pause();
-                    }
-                  }
-                }}
-                aria-label={bgAudioRef.current?.paused ? "Play" : "Pause"}
-              >
-              {bgAudioRef.current?.paused ? (
-                <svg viewBox="0 0 24 24" aria-hidden="true">
-                  <path d="M8 6l10 6-10 6z" fill="currentColor" />
-                </svg>
-              ) : (
-                <svg viewBox="0 0 24 24" aria-hidden="true">
-                  <path d="M8 6h3v12H8zM13 6h3v12h-3z" fill="currentColor" />
-                </svg>
-              )}
-            </button>
-            <button type="button" className="player-button" onClick={playNextBg} aria-label="Next track">
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M17 6v12M5 6l8 6-8 6" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
-            </button>
-          </div>
-        </div>
-        <div className="performance-card theme-panel-card">
-          <div className="perf-row">
-            <div className="perf-copy">
-              <p className="perf-label">Performance</p>
-              <p className="perf-note">Optimize motion + visuals for mobile.</p>
-            </div>
-            <button
-              type="button"
-              className={`button button-ghost perf-toggle${performanceMode ? " is-active" : ""}`}
-              onClick={() => setPerformanceMode((prev) => !prev)}
-              aria-pressed={performanceMode}
-            >
-              {performanceMode ? "On" : "Off"}
-            </button>
-          </div>
-        </div>
-        <div className="credits-footer">
-          {audioAttribution.map((item) => (
-            <span key={item.source}>
-              {item.source} — {item.license} (
-              <a className="modal-link" href={item.url} target="_blank" rel="noreferrer">
-                source
-              </a>
+                {tiles.map((tile, index) => (
+                  <Tile
+                    key={tile.id}
+                    tile={{
+                      ...tile,
+                      completeDirs: completeDirs.get(tile.id),
+                      pulseDelay: pulseDelays.get(tile.id),
+                      waveDelay: waveDelays.get(tile.id),
+                      waveActive
+                    }}
+                    onRotate={() => rotateTile(index)}
+                  />
+                ))}
+              </div>
+            )}
+          </main>
+
+          <ControlStack
+            themeMode={themeMode}
+            themeIndex={themeIndex}
+            themes={themes}
+            unlockedThemeLevels={progressCompletedSet}
+            showThemePicker={showThemePicker}
+            themePickerMounted={themePickerMounted}
+            onTogglePicker={toggleThemePicker}
+            onSelectRandom={selectRandomTheme}
+            onSelectTheme={selectFixedTheme}
+            bgVolume={bgVolume}
+            fxVolume={fxVolume}
+            onToggleBg={() =>
+              setBgVolume((prev) =>
+                prev === 0.6 ? 0 : prev === 0 ? 0.2 : prev === 0.2 ? 0.4 : 0.6
               )
-            </span>
-          ))}
+            }
+            onToggleFx={() =>
+              setFxVolume((prev) =>
+                prev === 2.5 ? 0 : prev === 1.6 ? 2.5 : prev === 0 ? 0.6 : prev === 0.6 ? 1.2 : 2.5
+              )
+            }
+            nowPlaying={audioTracks[bgNowPlayingIndex]?.title}
+            onPrev={playPrevBg}
+            onNext={playNextBg}
+            onTogglePlay={toggleBgPlay}
+            isPaused={isBgPaused}
+            isLoading={isBgLoading}
+            performanceMode={performanceMode}
+            onTogglePerformance={() => setPerformanceMode((prev) => !prev)}
+            audioAttribution={audioAttribution}
+          />
+        </>
+      )}
+
+      {needRefresh ? (
+        <div className="pwa-toast" role="status" aria-live="polite">
+          <div className="pwa-toast-copy">
+            <p className="pwa-toast-title">Update ready</p>
+            <p className="pwa-toast-note">A new version is available.</p>
+          </div>
+          <div className="pwa-toast-actions">
+            <button type="button" className="button" onClick={handleUpdateNow}>
+              Refresh
+            </button>
+            <button type="button" className="button button-ghost" onClick={handleUpdateLater}>
+              Later
+            </button>
+          </div>
         </div>
-      </section>
+      ) : null}
 
       {/* Sound testing UI hidden */}
     </div>

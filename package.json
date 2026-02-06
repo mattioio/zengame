@@ -8,6 +8,7 @@
     "build": "vite build",
     "predeploy": "npm run build",
     "deploy": "gh-pages -d dist",
+    "icons": "node scripts/generate-icons.mjs",
     "preview": "vite preview"
   },
   "dependencies": {
@@ -17,6 +18,8 @@
   "devDependencies": {
     "@vitejs/plugin-react": "^4.2.1",
     "gh-pages": "^6.1.1",
-    "vite": "^5.0.0"
+    "sharp": "^0.34.5",
+    "vite": "^5.0.0",
+    "vite-plugin-pwa": "^1.2.0"
   }
 }

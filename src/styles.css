@@ -793,7 +793,9 @@ body.perf-mode::before {
   left: 24px;
   right: 24px;
   bottom: 24px;
-  background: var(--board-bg);
+  background: var(--surface-bg, rgba(255, 255, 255, 0.94));
+  border: 1px solid rgba(30, 27, 23, 0.08);
+  backdrop-filter: blur(10px);
   border-radius: 18px;
   padding: 16px 18px;
   box-shadow: 0 20px 45px rgba(0, 0, 0, 0.18);

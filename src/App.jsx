@@ -3897,7 +3897,11 @@ export default function App() {
     const key = `${progressLevelNumber}-${difficultyLevels[difficultyIndex]}`;
     if (lastProgressBoardRef.current === key) return;
     lastProgressBoardRef.current = key;
-    emitEvent("board_started", { mode: "progress", level: progressLevelNumber });
+    emitEvent("board_started", {
+      mode: "progress",
+      level: progressLevelNumber,
+      difficulty: difficultyLevels[difficultyIndex]
+    });
   }, [isProgress, progressLevelNumber, difficultyIndex]);
 
   useEffect(() => {
@@ -3905,7 +3909,7 @@ export default function App() {
     const key = `${seedText}-${difficultyLevels[difficultyIndex]}`;
     if (lastEndlessBoardRef.current === key) return;
     lastEndlessBoardRef.current = key;
-    emitEvent("board_started", { mode: "endless" });
+    emitEvent("board_started", { mode: "endless", difficulty: difficultyLevels[difficultyIndex] });
   }, [isEndless, seedText, difficultyIndex]);
 
   useEffect(() => {
@@ -3916,7 +3920,8 @@ export default function App() {
     if (solved && !prevSolvedRef.current) {
       emitEvent("board_completed", {
         mode: isProgress ? "progress" : "endless",
-        level: isProgress && Number.isInteger(progressLevelNumber) ? progressLevelNumber : undefined
+        level: isProgress && Number.isInteger(progressLevelNumber) ? progressLevelNumber : undefined,
+        difficulty: difficultyLevels[difficultyIndex]
       });
       const step = 180;
       const groupSize = 2;
@@ -5105,6 +5110,11 @@ export default function App() {
                       className="button button-ghost"
                       onClick={() => {
                         const nextIndex = (difficultyIndex + 1) % difficultyLevels.length;
+                        emitEvent("difficulty_changed", {
+                          mode: "endless",
+                          from: difficultyLevels[difficultyIndex],
+                          to: difficultyLevels[nextIndex]
+                        });
                         setDifficultyIndex(nextIndex);
                         regenerate(seedText, difficultyLevels[nextIndex], { shuffleTheme: true });
                       }}

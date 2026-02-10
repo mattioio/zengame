@@ -5,7 +5,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 
-const base = "/zento/";
+const base = "/";
 const TOTAL_LEVELS = 96;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
